@@ -1,0 +1,636 @@
+---
+name: scene-review
+description: MUSE Phase 6 scene-reviewer subagent 的职责层 — 场景级四档分流决策（PASS / PATCH / ROLLBACK / REWRITE）。吃 pipeline/scenes/scene_{id}.md + scene_card.md + A findings（必读）+ L1 lint report；B/C findings 按 adaptive dispatch（文件存在则筛 scene_id 读取，缺席不阻断）。产 scene_{id}.yaml（verdict 字段 = 单一权威源）；PATCH 档额外产 patch_directive.yaml（source=scene_review）喂 Step 4.5 reviser。required input 缺失由 orchestrator input_gate 写 ESCALATED，见 phase6-scene-development execution-protocol §1.5。
+---
+
+# Scene Review — 场景级四档分流决策
+
+## 输入文件（硬约定）
+
+> 本 subagent **被 dispatch 时假定 required input 全部在场**。缺失输入由 orchestrator input_gate 写 `ESCALATED` 降级 yaml；schema 与清理协议见 `phase6-scene-development/references/execution-protocol.md §1.5`。
+
+**必读**：
+
+1. `pipeline/scenes/scene_{scene_id}.md` — 待评审的 scene 正文（由 writer 或上一轮 reviser 产）
+2. `pipeline/scene_{scene_id}/scene_card.md` — Phase 5 设计意图（value_start / value_end / scene_tasks / handoff）
+3. `pipeline/review/A_aesthetic.yaml` — A 审美组 findings（筛 `scene_id == 本场景` 的条目）
+4. L1 脚本 lint 报告（三份显式路径；**不要**用 glob，按 scene_id 精确读，避免误匹配其他场景或 future 新增 lint）：
+   - `pipeline/review/lint/{scene_id}.ai_filler.yaml`（S1：口癖 / Markdown / 排比 / 关联词）
+   - `pipeline/review/lint/{scene_id}.lexical_stats.yaml`（S2：副词 / TTR / 感官平衡 / 高频词——读 `density.*.imbalanced/overuse/too_low`）
+   - `pipeline/review/lint/{scene_id}.dialogue.yaml`（S3：纯台词 / 指代 / 模板说话动词 / 孤立说话动作）
+   - `pipeline/review/lint/{scene_id}.density_vs_ref.yaml`（**条件读**：仅 ref 场景且 orchestrator 跑了对齐校验时存在，缺失不阻断。读 `verdict` 字段——`SIGNIFICANT_DEVIATION` 且场景结构无正当理由时（题材性短切 / 纯对白段按 prose-craft ai-cliche E 类豁免先行核对）作为 PATCH 档的密度偏离信号并入 findings 翻译，不单独成档）
+
+**按需读**（adaptive：B/C 在本轮 dispatch 了才存在；存在则读，scene_id 命中本场景的 finding 才考虑；缺失不阻断）：
+
+5. `pipeline/review/B_narrative_consistency.yaml` — B 叙事一致性组 findings（筛 `scene_id == 本场景`；**`scene_id: null` 的条目跳过**）
+6. `pipeline/review/C_structural_consistency.yaml` — C 结构一致性组 findings（同 B 组规则）
+
+**按条件读**：
+- `pipeline/scene_{scene_id}/role_briefs.md` — 仅在 A 组 voice_consistency finding 涉及本场景角色时读
+
+**不读**：
+- 其他场景的 findings（除非 B/C 给的条目明确引用本场景）
+- phase0-5 yaml 全量（scene_card + findings 应自含足够上下文）
+- 本场景之前的 `scene_{id}.yaml`（fresh session 约定；且若存在则走幂等前置 ESCALATED，不进入评审）
+- 任何 skill 的 SKILL.md / references（通过运行时 skill 入口加载同名 skill，不用 Read）
+
+## 评审模式（首次 vs post-revision）
+
+scene-reviewer 有**两种 dispatch 模式**，由 orchestrator dispatch prompt 关键字决定：
+
+| 模式 | 触发关键字 | 目标产物 | 幂等锚点 | 触发场景 |
+|---|---|---|---|---|
+| 首次评审 | 默认（无 post-revision/post-rewrite 关键字） | `pipeline/review/scene_{id}.yaml` | 同上 | per-scene loop 后 Step 5 第一次 dispatch |
+| post-revision review | dispatch prompt 含 "post-revision" 或 "post-rewrite" | `pipeline/review/scene_{id}.post_revision.yaml` | 同上（**不**检查 `scene_{id}.yaml`——首次产物保留） | PATCH 档 reviser publish 后 / ROLLBACK 档 writer 重写 publish 后（与 PATCH 分支对称）|
+
+## Post-revision review schema（三层 gate）
+
+post-revision 模式必须输出以下结构；三层 gate 都要写 `evaluated: true`，即使 Gate 1 已失败也不短路 Gate 2/3。机器失败但 reviewer 合法放行时只通过 `ai_pattern_gate.override.applied` 表达。
+
+```yaml
+review_round: post_revision_round1
+verdict: PASS | PATCH | ROLLBACK | REWRITE
+
+ai_pattern_gate:
+  machine_gate: pass | fail
+  reviewer_gate: pass | fail | override
+  override:
+    applied: false
+    override_reason: null
+
+targeted_span_gate:
+  evaluated: true
+  gate_pass: true
+  per_patch:
+    - patch_id: patch_01
+      patch_kind: rewrite_sentence | rewrite_span | delete_token | replace_phrase
+      local_lint_v1_family_set: []
+      local_lint_v2_family_set: []
+      same_family_remaining: false
+      new_family_introduced: false
+      semantic_function_preserved: true
+      contract_conflict_observed: false
+
+scene_residual_gate:
+  evaluated: true
+  gate_pass: true
+  unresolved_high_spans: 0
+  unresolved_medium_spans: 0
+  unresolved_low_spans: 0
+  needs_patch_hits: 0
+
+pattern_migration_gate:
+  evaluated: true
+  gate_pass: true
+  old_family_set: []
+  new_family_set: []
+  old_subtype_set: []
+  new_subtype_set: []
+  cross_cluster_migration: false
+  same_cluster_migration: false
+```
+
+**post-revision review 不进入降级 yaml 路径**：post-revision 模式下，required input gate 仍由 orchestrator 在 dispatch 前跑 verify_scene_review_inputs.py（review/ 此时已有最新 A/B/C/lint）；input gate 失败 → orchestrator 写降级 yaml 到 `scene_{id}.yaml`（首次锚点位置），post-revision dispatch 不发生。
+
+## Post-revision 三层 gate 判定语义
+
+post-revision 模式必须三层全 evaluated：Gate 1 fail 不短路 Gate 2/3；第二轮 PATCH 需要同时知道 targeted span、全场残留、pattern migration 三类根因。
+
+Gate 1 targeted span 是主判据；Gate 2/3 只作 residual / migration 诊断。
+
+**Gate 1 targeted_span_gate** 是主判据。每个 patch 必须同时满足：
+- `same_family_remaining=false`
+- `new_family_introduced=false`
+- `semantic_function_preserved=true`
+
+任一 patch 不满足，Gate 1 fail；targeted span 失败不计作 Gate 2 的 unresolved span。
+
+**Gate 2 scene_residual_gate** 判全场 residual：`unresolved_high_spans=0`、`unresolved_medium_spans=0`、`unresolved_low_spans=0`、`needs_patch_hits=0` 才 pass。剩余 hit 必须在 ledger 中有明确 status；observed / exempted 只能以 carried 状态保留，不得静默丢失。
+
+**Gate 3 pattern_migration_gate** 比较 family / subtype set：
+- `old_cluster != new_cluster` → `cross_cluster_migration=true`
+- `old_cluster == new_cluster` 且 family set 无交集、new family 仍属高风险 cluster → `same_cluster_migration=true`
+- family 相同但 subtype 迁到更高风险模板 → 记 migration candidate，由 reviewer 判读
+
+**混合判定**：
+- `machine_gate = targeted_span_gate.gate_pass AND scene_residual_gate.gate_pass AND pattern_migration_gate.gate_pass`
+- `reviewer_gate=fail` 时，即使 machine_gate pass 也升 PATCH
+- machine_gate fail 时，只有 `reviewer_gate=override` 且 `override.applied=true` 并给出明确 reason，才能 PASS
+- machine_gate fail 且无合法 override → PATCH；连续二轮仍 fail 时升 ROLLBACK
+
+## superficial_patch_failed 检测
+
+在 Gate 1 + Gate 3 内嵌检测：
+
+- `patch_kind=delete_token`，但 new_span local lint 仍命中 same family heuristic → `superficial_patch_failed=true`
+- `patch_kind=rewrite_sentence` / `rewrite_span`，但 new_span local lint 仍命中 same family 主模式 → `superficial_patch_failed=true`
+
+命中即强制 `verdict=PATCH` 二轮，并升级 patch_kind：
+
+- `delete_token` → `rewrite_sentence`
+- `rewrite_sentence` → `rewrite_span`
+- `rewrite_span` → `ROLLBACK`
+
+## Gate 3 pattern_migration 判定纪律
+
+machine 检出 migration 是**候选**，不是判罪——scene-reviewer 逐条确认：
+
+- reviewer 判定为合理修订（同主题 cluster 内收缩、写实化、或 scene function 明确需要）→ 写 override，`gate_pass=true`
+- 否则确认 hard fail，`verdict=PATCH` 二轮
+
+不要把 migration 一律当作机器硬失败——机器检出的误报由 reviewer 确认环节吸收。
+
+## 幂等前置检查（启动第一步·硬约定）
+
+```
+# 首次评审模式
+verdict_path = pipeline/review/scene_{scene_id}.yaml
+
+# post-revision review 模式（dispatch prompt 含 "post-revision" / "post-rewrite"）
+verdict_path = pipeline/review/scene_{scene_id}.post_revision.yaml
+
+if verdict_path.exists():
+    Task reply: "ESCALATED(already_reviewed); {scene_id} 已评审"
+    不再产任何文件，不覆盖 verdict 或 patch_directive
+    return
+```
+
+锚点选择理由：目标 verdict yaml 是所有 scene-reviewer 档（PASS / PATCH / ROLLBACK / REWRITE）的统一产出，能覆盖所有档的"已评审"状态——不像 `patch_directive.yaml` 只在 PATCH 档产，作锚点无法覆盖其余档。
+
+`verdict_source_conflict` / `verdict_missing` 触发重派时，**orchestrator 先主动删** `verdict_path` 再 dispatch fresh session——scene-reviewer 本身不感知"是否重派"，只看锚点存在性。
+
+**降级 yaml 让位**：当现存 `verdict_path` 是 `written_by: orchestrator_input_gate` + `verdict: ESCALATED` 的 input gate 降级 yaml 时，**orchestrator 在 dispatch 前**已**原子移动**该 yaml 到 `pipeline/review/scene_{id}.input_gate.yaml`（保留 audit），所以 scene-reviewer 启动时 `verdict_path` **不存在**，幂等前置正常通过。scene-reviewer 自身**不感知**降级 yaml 让位逻辑——这是 orchestrator 的责任（详见 `phase6-scene-development/references/execution-protocol.md §1.5` Step 2.5）。
+
+## scene_id=null 全文级 finding 路由规则
+
+B/C 组的 `scene_id: null` finding（全文级问题，如 `narrative_style` 跨场景漂移 / `pipeline_crosscheck` 设计矛盾 / `timeline_plot` 跨场景时序）**不进入本 scene-review 的输入**。
+
+全局路由由 **orchestrator** 处理：
+- orchestrator 聚合 `scene_id=null` finding 到 `pipeline/review/global_findings.yaml`
+- 若全局有 CRITICAL 级 finding → orchestrator 按优先级决定全局动作（升级人工 / 回退 Phase 5 以上）
+- **两层并行**：全局问题不阻止单场景 scene-review 继续产局部 verdict——局部信息自带价值（后续 orchestrator 汇总决策用）
+
+你只管能定位到本场景 scene_id 的 finding，不尝试归属全文级问题。
+
+## 四档分流判据（原则性）
+
+| 档 | 判据 | 后续 | 来源 |
+|---|---|---|---|
+| **PASS** | 无 CRITICAL 级，minor 占多数；scene value_change 与 scene_card 设计一致（读 scene_card 的 value_start/value_end） | orchestrator 跳过修订；进 Step 7 整合 | scene-reviewer |
+| **PATCH** | 有 major，**但位置可定位、方向明确、减法可解**；**不涉及**设计事实偏离 / 人物 OOC / 价值变化方向错反 / 场景整体节奏崩塌；**且无 C/B blocker** | 产 `patch_directive.yaml` → reviser 接线 | scene-reviewer |
+| **ROLLBACK** | scene_card 设计事实偏离 / 人物 OOC / 价值变化方向错反 / 场景整体节奏崩塌；**或** PATCH 定点修无法覆盖；**或** 存在 C `pipeline_crosscheck` / B `characterization` blocker | orchestrator 派 writer fresh session **重写本场景**（不回上游） | scene-reviewer |
+| **REWRITE** | 问题涉及 Phase 3-5 设计层缺陷（脊椎 / 结构 / 场景编排本身错） | orchestrator 升级人工，回退 Phase 5 以上 | scene-reviewer |
+input 缺失不属于本 subagent 分流档；orchestrator input_gate 写 `ESCALATED`，本 subagent 永不在主体 yaml 中写 `verdict=ESCALATED`。
+
+**硬约定**：
+- **C 组 `pipeline_crosscheck` / `timeline_plot` / `world_building` 出现 blocker** → **不得定 PATCH**，至少 ROLLBACK
+- **B 组 `characterization` 出现 blocker**（人物 OOC / 记忆断裂 / 知识矛盾） → **不得定 PATCH**，至少 ROLLBACK
+- 不硬编码阈值——判读"blocker / major / minor"由你对 finding `issue` 字段语义+严重度综合判
+- finding 自带 `severity` 字段时（story-review output-schema 枚举 `CRITICAL` / `IMPORTANT` / `INFO`）作判读**起点**：CRITICAL 从 blocker 起判、INFO 从 minor 起判、字段缺省按 IMPORTANT 从 major 起判；语义判读可升降——字段是输入不是结论
+
+## 判档算法决策树（含证据门槛）
+
+前提：lint 命中只是定位风险，修订目标是消除该 span 的 AI 叙述形态。
+
+## Cluster 治理
+
+接到 ai_filler_lint 输出含 `cluster_alerts[]` 字段时，按以下硬协议处理：
+
+1. **cluster_alert.severity >= medium → 必须生成 cluster-level finding**
+   - 不允许逐条对每个 hit 判 `observed` / `exempted`
+   - 唯一例外：cluster_alert.governance.individual_exemption_allowed = true 时，按窄豁免三条件判读
+
+2. **patch 形态由 distribution.mode 决定**（参见 design doc §5.2 4 档映射）
+   - single_span → 1 个 rewrite_span 覆盖该段
+   - single_sentence → 1 个 rewrite_sentence
+   - distributed → patch_set（多个 rewrite_sentence / rewrite_span 同 cluster_id 绑）
+   - catastrophic → ROLLBACK writer fresh session
+   - paragraph_pattern → rewrite_span 段级改写
+
+3. **ledger 输出**
+   - cluster_alert 对应 ledger entry 含 cluster_id + governance_compliance.individual_exemption_allowed
+   - 同 cluster 所有 individual hit ledger entry 写 `merged_into: <cluster_id>`
+
+4. **禁单超大 rewrite_span 覆盖全场**——distributed 必须拆 patch_set
+
+## reader_yield_check 硬子表
+
+scene-reviewer 不写散文判断，按以下机械化子表填 `reader_yield_check[]` 字段。
+
+### reader_yield_check 必填触发（4 路 OR）
+
+scene-reviewer 对一个 lint hit 必填 reader_yield_check **当且仅当**满足下列任一：
+
+1. **≤6 字非对白独立短句**：hit 命中 `zero_yield_micro_clause_candidate` 且短句长度 ≤6 字
+2. **≤10 字 + 特殊命中**：hit 长度 ≤10 字 且 命中 `state_persistence_tag` / 标签式结论（"化了 / 断了"类）/ 已进 cluster_alert
+3. **同段短句聚集**：hit 所在段与 `short_paragraph_run` hit 共现（同段短句数量 ≥ 阈值）
+4. **A 组 ledger observed + 进 high cluster**：hit 在 story-review A 组 ledger 标 observed 且本场进 high cluster_alert
+
+其余 ≤10 字非对白短句保留 lint 候选（advisory），但 reviewer 不强制填表。
+
+8 yield 类型 + 举证倒置规则不变（见本 SKILL 既有段）。
+
+### post-revision PASS 准入硬协议
+
+post-revision review verdict=PASS 准入条件——任一不满足 → verdict 强制改 PATCH 进二轮：
+
+- **所有 v2 high cluster_alert 命中 hit_ids 必须 ledger.post_revision_updates 中 status ∈ {patched, merged_into_higher, migration_verified, formal_function_exempted(+carrier)}**
+- **禁用 status**：`observed_not_patched` **弃用**——reviewer 不能用"功能性 / 节奏 / 留白"等理由放走 high cluster 残留；medium cluster 可用 observed 但 high 不可
+- **formal_function_exempted 例外**：每条必须 `carrier_function_link: <scene_card.physical_carrier[*].function_link>` 绑定具体 carrier 的 function_link（真实 schema 字段，非 id）；scene 总 formal_function_exempted 数 **≤3**（兼顾 recognition_object / 名字仪式 / 节拍韵律 3 类高 impact functional 节拍）
+- **medium cluster**：必须 ledger.v1_triage 项有 `status` + `reason`（10-30 字），可 status=observed 不强制 patch
+
+准入失败 → `scene_review_schema_validator.py` 输出 hard fail，verdict 强制改 PATCH。
+
+### 8 yield 列表（举证倒置）
+
+每候选填 yields 子字段：
+
+- plot_change：情节变化（需指明改变了什么情节走向）
+- danger_change：危险变化（需指明危险升降）
+- tactical_change：战术变化（需指明战术选项变化）
+- character_choice：人物选择（需指明人物做出了什么选择）
+- relationship_shift：关系变化（需指明关系前后差异）
+- world_rule：世界规则（需指明显形的规则）
+- sensory_irreplaceable：不可替代感官（需指明该感官无法用其他形式呈现）
+- formal_function：明确形式节奏功能（需指明节奏功能的具体作用且通过非短句方式无法实现）
+
+**填法**：默认全 false；升 true 必须 yield_evidences 中显式给 yield_type + >=10 字 <=30 字可验证理由。**不要填无 evidence 的 true**，schema validator 会硬阻断。
+
+### verdict -> recommended_action 映射
+
+| verdict | recommended_action |
+|---|---|
+| zero_yield | delete |
+| low_yield_label | convert_to_consequence |
+| low_yield_mergeable | merge |
+| harmful_pattern | rewrite |
+| effective | keep |
+
+### Cluster 内禁逐句豁免
+
+若同 scene 同功能短句聚集触发 low_information_cadence，**不允许**逐条对每候选判 effective。必须形成 cluster-level finding，集体走 cluster patch_set。
+
+### 反向防御 5 条禁用豁免理由
+
+不要用以下理由升 yield 为 true（schema validator 会标 reason 模糊）：
+- "节奏需要这一停顿"（除非能指认 formal_function 具体作用）
+- "强化氛围 / 渲染气氛"（氛围必须通过具体感官，不是短句承重）
+- "保留文学性 / 这是 voice"（voice 不能用 zero_yield 短句承载）
+- "读者可能漏看，加一句确认"（读者漏看不是这句存在的理由）
+- "美感 / 留白 / 顿挫"（非 falsifiable 表述）
+
+scene-reviewer 读：
+- A 组 findings + A 组产的 `lint_resolution_ledger.yaml`
+- ai_filler_lint 报告（含 `span_aggregation` + `severity_basis`）
+- scene_card 豁免字段（paragraph_rhythm / craft_carrier / pov_constraint / narrator_distance）
+
+按以下决策树综合判读：
+
+```text
+for each finding / lint span:
+    # 1. 豁免前置
+    # 豁免必须三者并存：scene_card 字段 + 局部文本证据 + 场景功能声明。
+    # 两个例外不走单字段豁免（与 A_aesthetic-carrier §0 同款）：
+    # - subtext_translated_by_narrator：须为误读型解码（与后文证据矛盾）才豁免，
+    #   narrator_distance=unreliable_first 命中不自动豁免
+    # - 同一句式模板全篇高频命中：不得按叙述者声线整批豁免——保少数代表用例，
+    #   其余按对应 family repair_strategy 修
+    if 豁免命中（scene_card_field + local_textual_evidence + function_claim）:
+        mark exempted in ledger, skip
+
+    # 2. 语义 cluster 优先判，加证据门槛
+    if dominant_cluster ∈ {figurative_debt, social_choreography, silence_pause_cliche, abstract_explanation}
+       AND (
+            severity_aggregate ≥ medium
+            OR ledger.triage.status in {finding, merged}
+            OR same-family scene-level count ≥ rule 自定义阈值
+       ):
+        if 限单句:
+            patch_kind = rewrite_sentence
+        else:
+            patch_kind = rewrite_span
+        # 理由：语义层删词不掉，必须重写承载方式。
+
+    elif severity_aggregate=high 跨多句:
+        patch_kind = rewrite_span
+
+    elif severity_aggregate=high 限单句 or 同句多 family:
+        patch_kind = rewrite_sentence
+
+    elif 单点 hard cliche + 无 same-span heuristic:
+        # 同 span 含 ≥2 family 信号时禁 delete-only，强制走 rewrite_sentence/span。
+        patch_kind = delete_token / replace_phrase
+
+    elif 全场 ≥ 3 个 span hint=rewrite_sentence/span:
+        verdict = ROLLBACK
+
+    elif scene_card 设计本身只剩调度 / 库存 / 移动:
+        verdict = REWRITE
+
+    else:
+        mark observed in ledger, no patch
+```
+
+**核心证据门槛**：`dominant_cluster ∈ 语义 cluster` 不再单独足以触发 rewrite；必须同时满足 `severity_aggregate ≥ medium` / ledger 已标 finding 或 merged / 同 family scene-level count 足量。避免单个 low semantic hit（如孤立"看了一眼"）被过度升级。
+
+**信息过载分流**（reader-review §10 / A 组报"信息过载"型 finding 时）：
+
+scene-reviewer 读 `scene_card.reader_track`，对照正文判 reader 是否能跟住主线。按现象分流：
+
+| 现象 | 档位 |
+|---|---|
+| 少量解释句、重复线索、局部物证过密——可由 reviser 删几句降密度 | PATCH |
+| reader_track 失焦、角色轮流交付专业结论、多机制同等展开（main 层超载） | **ROLLBACK** |
+| 场景目标和信息结构整体错位（reader_track 与 scene_tasks main 任务无法对齐） | **REWRITE** |
+
+scene-reviewer 只读 `scene_card.reader_track`，**不**重新解释 Phase 3 / Phase 4 字段——分流决策基于 A/B/C + lint + scene_card，不上溯设计层。
+
+## 承载完整性信号（与 craft_carrier / narrator_distance 联动）
+
+A 组 §11 输出的 `carrier_*` finding 与 B 组 narrator_distance 漂移 finding 走专有判档路径——这些信号涉及"设计与正文偏离"，**不**走通用 PATCH/ROLLBACK 启发式，而是按 `patch_kind` 直接绑定档位：
+
+| 信号 | 现象 | 档位 | patch_kind |
+|---|---|---|---|
+| `carrier_then_explain` | carrier 出现并完成意义后，正文又解释一遍 | PATCH | `carrier_then_explain` |
+| `omission_violated` | scene_card 声明 `omission_plan`，正文偏要解释 | PATCH | `omission_violated` |
+| `omission_filled_in` | writer 把名著式留白填实了 | PATCH | `omission_filled_in` |
+| `carrier_missing` | scene_card 声明 carrier，正文找不到 anchor | **ROLLBACK** | `carrier_missing`（设计与正文偏离，超出定点修范围） |
+| `narrator_distance_global_drift` | narrator_distance 跨场景漂移 / 场景内基调反复跳 | **ROLLBACK** | `narrator_distance_global_drift`（场景整体节奏问题，非局部） |
+
+完整 enum + 各 patch_kind 的修订方向见单一来源 [`../revision/references/patch-kind-registry.md`](../revision/references/patch-kind-registry.md)。scene-reviewer 写 patch_kind 时按 registry 的 PATCH 类填；若 finding 属于 ROLLBACK 类（registry `requires_rollback_reason` 段）→ 直接定 ROLLBACK 档，**不**写 patch_directive。
+
+## prose_risk_contract compliance check
+
+scene_card 含 `## 写作层 AI pattern 预防 (prose_risk_contract)` 段且 `used=true` 时（schema 见 [`../phase5-scene-arrangement/references/output-schema.md`](../phase5-scene-arrangement/references/output-schema.md) `## prose_risk_contract`），scene-reviewer 把 contract 当审阅闭环的语义上游：读 contract 后比对正文，正文残留 contract `risk_families` 命中 family 的 pattern → 标 `source: prose_risk_contract_violation`（区别于 lint finding / A 组 finding），写入 finding 的 `issue` 描述（让下游 reviser 通过 patch_directive 看到这是 writer 未遵守 contract，非新发现）。
+
+severity 按密度判（描述性）：单点轻度残留 → `major`（PATCH）；同 span 多 family 共现 / 全场反复同 family 命中 → `blocker`（ROLLBACK）；全场反复多 family 命中 + scene_card 已声明 `used=true` → ROLLBACK。
+
+**PATCH 档契约**（用现有 patch_directive schema，不引入新字段）：
+
+- `issue`：把 contract `risk_families` 命中信息写入（如"contract 声明 risk_families=`动作清单化`，本 patch 段落仍出现该 family 形态：'去 A，去 B' 连续 3 拍"）
+- `suggested_action`：把 contract `positive_strategy` / `bad_shape_examples` 翻译成本 patch 的修订指引（如"按 contract positive_strategy 把连续动作合并到关系压力变化点；本 patch 段落具体改：删两个流水动作 + 保留一个有关系变化的动作"）
+- 不引入新字段——保持 schema 闭合在现有 patch_directive 的 `issue` / `suggested_action`
+
+边界：
+
+- 缺段 → 不做 compliance check，按通用四档分流走
+- scene-reviewer 不修 contract 本身——contract 本身有误（family 命名错 / positive_strategy 无意义）→ 升 REWRITE 回 Phase 5
+- contract violation finding 不替代 lint / A 组 finding——三者可并存
+
+## 低读者收益动作链分流
+
+scene-reviewer 不问动作是否真实，只问动作是否值得读者完整阅读。凡是没有新增危险、欲望、关系、世界规则、人物裂隙、情绪转折或形式惊艳的动作链，优先压缩或删除。
+
+**判档信号（信号词，无句数阈值）**：
+
+| 现象 | 档位 |
+|---|---|
+| 少量机械过渡动作，局部减法即可清 | PATCH |
+| 形成可识别的低收益链（同构句式连续呈现），需压成结果 + 锚点 | PATCH |
+| 主戏被库存 / 路线 / 检查动作吞没，核心戏剧变化不可见 | ROLLBACK |
+| 场景设计目标本身只剩搜集 / 移动 / 说明 / 盘点，无戏剧变化 | REWRITE |
+
+**PATCH 档的修订方向必须是减法**：写清"压缩目标 / 保留项 / 删除项"。禁止只要求"写得更生动"，也不要落具体句数硬阈值。
+
+**协议层不变**：本规则上游信号来自 A 组 §6 段级判读（A 组主链路）；reader-review 兜底已迁至 Phase 7 处置，scene-review **不**消费 reader-review。SKILL.md L127-136 现有「豁免后处理」段保持原样。
+
+## 豁免后处理（消费 reader-review finding 时）
+
+reader-review 是盲读体验代理人，不知道 scene_card 设计意图。scene-reviewer 拿到 reader-review 的"出戏 / 反应过淡 / 信息不足 / 心理空白"类 finding 后，对照 [`prose-craft/references/ai-cliche-patterns.md`](../prose-craft/references/ai-cliche-patterns.md) §"名著式合法手法豁免"清单，按 4 类前置过滤：
+
+1. 该位置是否对应 `scene_card.pov_constraint.intentional_blind_spot` → 是 = 豁免，不报
+2. 该位置是否对应 `scene_card.omission_plan` → 是 = 豁免，不报
+3. 该位置是否对应 `scene_card.narrator_distance` 的合法选择（`archival_zero` / `unreliable_first` 等）→ 是 = 豁免，不报
+4. 该长独白是否满足 reframing 三项以上（详见 [`story-review/references/A_aesthetic-micro_language.md`](../story-review/references/A_aesthetic-micro_language.md#reframing-独白判读) §reframing 独白判读）→ 是 = 豁免，不报
+
+四类都过不了 → reader-review 的 finding 进入 scene-review 档位流程，按通常规则定档（PATCH / ROLLBACK / REWRITE）。
+
+**硬约定**：豁免要求 scene_card 字段**显式声明**（不允许 scene-reviewer 脑补"这是名著手法"）。scene_card 漏标但正文出现合法名著手法时，仍报上去——orchestrator 决定是补 phase5 字段（ROLLBACK 回 Phase 5）还是 PATCH 修正，不在本层吞掉。
+
+## 输出
+
+### 1. `pipeline/review/scene_{scene_id}.yaml`（所有档必产）
+
+**scene-reviewer 产物 schema**（input 全在场时由 subagent 写）：
+
+```yaml
+scene_id: S01
+verdict: PASS | PATCH | ROLLBACK | REWRITE        # scene-reviewer 永不写 ESCALATED
+review_incomplete: false                          # scene-reviewer 始终 false
+missing_inputs: []                                # scene-reviewer 始终空
+written_by: scene-reviewer                        # 标注产出来源
+rationale: |
+  (3-5 句说明为什么这一档；引用最关键的 1-3 条 finding。
+   若 ROLLBACK/REWRITE，说明是哪个维度触发的升档硬约定)
+
+findings_summary:
+  total: 7
+  by_source:
+    lint: 3          # L1 脚本
+    A: 3             # 模型审阅
+    B: 1
+    C: 0
+  by_severity:
+    blocker: 0       # 必须修（触发 PATCH 以上）
+    major: 2
+    minor: 5
+
+# 可选：若 PATCH/ROLLBACK/REWRITE，列出主要问题的 finding_id 或 location
+key_findings:
+  - source: A
+    dimension: on_the_nose
+    location: "L45"
+    severity: major
+```
+
+orchestrator input_gate 降级 yaml schema 见 phase6 execution-protocol §1.5；本 skill 不产该文件。
+
+### 2. `pipeline/scene_{scene_id}/patch_directive.yaml`（仅 PATCH 档）
+
+**Traceability 短锚**（hard gate，详见 [`references/traceability-protocol.md`](references/traceability-protocol.md)）：每 patch 必须含 ≥ 8 字 `anchor_quote` 命中当前 `pipeline/scenes/scene_{id}.md`；`issue_id` / `issue` 不得引用 C 组黑名单 finding（user_accepted / next_round_only；裸 `status=persists` 不入黑名单）。**校验由 `check-reviser-patch` hook 在 reviser dispatch 前自动执行**；未通过 → stderr WARN。**scene-reviewer 自身职责**：每个 patch 写 `anchor_quote` 字段（原句精确截取），不靠在 location 字段里塞引号；不主动跑 verify 脚本——hook 接管。
+
+schema 对齐 reviser 消费（`revision` skill 的 patch_directive.yaml schema）：
+
+```yaml
+source: scene_review     # scene-reviewer 自动产出
+scene_id: S01
+
+patches:
+  - anchor_quote: "就在这时，他抬起头看了看远方"      # ≥ 8 字精确原句，verify 脚本直接 substring match
+    location: "L23 附近"                               # 人读定位提示（reviser 用）
+    issue: "AI 口癖'就在这时'重复 3 次（S1 lint confidence=high）+ 中断叙事节奏（A §1 判读）"
+    suggested_action: "删除 2 处，保留 1 处或改为具体动作衔接"
+    issue_id: A-on_the_nose-L23+lint-S1-parallel_negation-1
+    patch_kind: null                                   # 通用 patch；不属于反 AI 化定向类时填 null
+
+  - anchor_quote: "她声音有些颤，说话的间隙比平时要长"
+    location: "L45 附近"
+    issue: "对白前后无神态/动作描写（S3 isolated_speech_beat）+ 声音'有些颤'是库存短语（A §1-D）"
+    suggested_action: "删'有些颤'，加一个指节/视线/呼吸的具体细节替代"
+    issue_id: A-voice_narrow-L45+lint-S3-isolated-2
+    patch_kind: null
+```
+
+**`patch_kind` 字段**（可选，反 AI 化定向修订时填）：
+
+```yaml
+patch_kind: "<see ../revision/references/patch-kind-registry.md PATCH 类>"
+# 物理 enum 在 MUSE-writing/skills/revision/references/patch-kind-registry.md
+# scene-reviewer 写 patch_kind 时按 registry 的 PATCH 类填（carrier_then_explain /
+# omission_violated / narrator_self_corrects / emotion_naming_under_face_loss /
+# care_tone_violence_dropped / omission_filled_in）；
+# 通用 patch（非反 AI 化定向）填 null
+# 若 finding 属于 ROLLBACK 类（epic_death_facing / mirror_loosened / carrier_missing /
+# narrator_distance_global_drift）→ scene-reviewer 直接定 ROLLBACK 档，不写 patch_directive
+```
+
+完整 enum + 各 patch_kind 的修订方向参见 [`../revision/references/patch-kind-registry.md`](../revision/references/patch-kind-registry.md)（单一来源；本 SKILL.md 不复制 enum 块）。
+
+**Schema 强化短锚**：每个 patch 必须含 `anchor_quote` 字段（≥ 8 字精确原句），verify 脚本直接 substring match 当前 `pipeline/scenes/scene_{id}.md`。完整规则与 why 见 [`references/traceability-protocol.md §1`](references/traceability-protocol.md)。
+
+**rewrite 类 schema 扩展**：
+
+```yaml
+patches:
+  # 单 anchor 类型：delete_token / replace_phrase / 现有 PATCH 类
+  - patch_id: patch_01
+    patch_kind: delete_token | replace_phrase | carrier_then_explain | omission_violated
+    anchor_quote: "不少于 8 字的当前正文原句"
+    location:
+      line_range: [23, 23]
+    issue: "定位到的病灶"
+    suggested_action: "定点删除或替换"
+
+  # rewrite_sentence：单句 semantic_rewriter
+  - patch_id: patch_02
+    patch_kind: rewrite_sentence
+    anchor_quote: "不少于 8 字的当前正文原句"
+    location:
+      line_range: [31, 31]
+    rewrite_directive:
+      semantic_function: "这句在场景里必须保住的功能"
+      preserve:
+        - "必须保留的人物意图 / 关系信息 / 物件功能"
+      remove_patterns:
+        - "要消除的 family / cluster / 具体模板"
+      target_style: "可见动作 / 物件 / 关系压力承载，不扩写"
+      max_sentences: 1
+      allowed_carrier_changes:
+        low_intensity: true
+        plot_adjacent: []
+
+  # rewrite_span：多句到一段 semantic_rewriter
+  - patch_id: patch_03
+    patch_kind: rewrite_span
+    anchor_quote_start: "old_span 开头的精确原句"
+    anchor_quote_end: "old_span 结尾的精确原句"
+    old_span: "从 anchor_quote_start 到 anchor_quote_end 的完整旧 span"
+    location:
+      line_range: [40, 43]
+    rewrite_directive:
+      semantic_function: "该段必须保住的场景功能"
+      preserve:
+        - "plot fact / relationship fact / object state"
+      remove_patterns:
+        - "同 span 要消除的 family / cluster"
+      target_style: "重组承载方式，保留事实，不新增 plot fact"
+      max_sentences: 4
+      allowed_carrier_changes:
+        low_intensity: true
+        plot_adjacent:
+          - "仅当 preserve 明示允许时才替换的 carrier"
+```
+
+### patch 组装优先级 + 同位置冲突处理
+
+**优先级**（高到低）：
+
+| 优先级 | 来源 | 备注 |
+|---|---|---|
+| 1 最高 | C 组 `pipeline_crosscheck` / `timeline_plot` / `world_building` | CRITICAL 级已触发升档 ROLLBACK 不入 PATCH；非 CRITICAL 作主 patch |
+| 2 | B 组 `characterization` / `factual_detail` / `narrative_style` | blocker 同 C；非 CRITICAL 作主 patch |
+| 3 | A 组语义维度（voice_consistency / value_change / on_the_nose / credibility / action_log / micro_language / sensory_balance / pov_boundary / scene_ending） | 作主 patch 的 issue 来源 |
+| 4 最低 | L1 lint 脚本命中（hits[rule=...]） | 模式证据——必须进入 ledger triage；是否 patch 由 triage 状态和 span 聚合结果决定 |
+
+lint 单独命中且 `severity_aggregate ≥ medium` 的 span，**必须 triage 进 ledger**（不静默放走）；是否独立成 patch 取决于 ledger 中该 hit 的 triage 状态：
+
+- `triage.status ∈ {finding, merged}` 且非豁免 → 独立成 patch
+- `triage.status=observed` 且 `span_aggregation high` → 可升级为 patch（scene-reviewer 综合判）
+- `triage.status=observed` 且 `span_aggregation low/medium` → 保持 observed，不 patch
+- `triage.status=exempted`（三者并存合法） → 不 patch
+
+**核心区别**：必须 triage ≠ 必须 patch。豁免合法的 hit 保持 exempted，不被强制 patch。
+
+**patch 总量收敛**（罩住 delete 类与 reader_yield recommendation，判据是信号不是数字门槛）：组装完成后看整体——patch 量超出 reviser 单轮可靠施工量的信号：定点 patch 铺满全场多数段落、或多条 patch 针对同一深层叙述形态的不同表层位置。命中时不要全部下发：同形态的合并为 span 级 rewrite patch（一个 cluster 一条）；合并后仍超载说明问题是结构性的——升档 ROLLBACK 让 writer 重写，比海量定点修更可靠。
+
+## lint_resolution_ledger 更新协议
+
+所有 lint hit 必须在 ledger 中有 triage.status 和 resolution.status，不允许静默放走。
+
+### 写入责任分工
+
+- **A 组 `a_aesthetic_round1`** 首次产 ledger，写入 `v1_triage` 块（**immutable** —— 后续 review 轮不得修改）
+- **scene-reviewer post-revision review** 每轮追加一个 `post_revision_updates` 块（**append-only**，不覆盖前轮 update）
+
+### 读取语义
+
+读 ledger 时：当前 `resolution.status` = 最后一个 update 块中该 lint_id 的最新 status；若 lint_id 仅在 `v1_triage` 出现而未在任何 update 块中，则当前 status = `v1_triage.resolution.status`（默认 unresolved）。
+
+**弱表述候选路由**：`dialogue_lint` 的 `weak_character_expression_candidate` 只是 L1 候选提示，不能单独转 PATCH。只有 A 组已确认 `dimension: micro_language, subkind: weak_character_expression`，且给出可命中的 `evidence_quote` / 原句引述时，才可进入 `patch_directive.yaml`。
+
+**合并规则**：
+
+1. **同位置 + 动作方向兼容**（都偏删 / 都偏加 / 高层修局部 + 低层模式层补充） → 合并一个 patch，`issue` 汇总，`suggested_action` 取最高优先级方向，`issue_id` 用 `+` 拼接
+2. **同位置 + 动作方向冲突**（一个偏删 / 一个偏加） → **禁止合并**，两种处置任选：
+   - (a) 拆成两个独立 patch，按优先级顺序排列（reviser 按序施工）
+   - (b) 若高优先级那条涉及 C/B blocker → 直接升档 ROLLBACK，不产 patch_directive
+3. **跨位置** finding 无冲突概念——各自独立成 patch
+
+## verdict 单一权威源规则
+
+**`scene_{id}.yaml` 的 `verdict` 字段 = 唯一权威源**。
+
+post-revision review 使用同一 schema，但写入 `pipeline/review/scene_{scene_id}.post_revision.yaml`，用于 PATCH 闭合验证。
+
+Task reply 文本也**必须**回显 verdict 作 orchestrator 快速提示：
+
+```
+done scene-review for scene S01; verdict=PATCH (3 patches, 0 blockers)
+```
+
+orchestrator 按 phase6 execution-protocol §1.5 解析 verdict。Task reply 不能替代 `scene_{id}.yaml`；即便 reply 写 PASS，文件缺失仍判 ESCALATED。
+
+## ESCALATED 停机 reason 分类
+
+scene-reviewer 本身可能触发的 ESCALATED reason（orchestrator 区分运行时失败 vs 审阅正常分档）：
+
+| reason | 触发场景 |
+|---|---|
+| `already_reviewed` | 幂等前置命中（`scene_{id}.yaml` 已存在） |
+| `verdict_missing` | 写了但字段格式错 / 或根本没写（通常 agent 崩溃） |
+| `verdict_source_conflict` | Task reply 与 scene_{id}.yaml 的 verdict 不一致 |
+
+**`dispatch_failed` / `lint_script_failed` / `model_review_failed`** 在 orchestrator 侧判定，不是 scene-reviewer 自己的 reason。
+
+`verdict=ROLLBACK` / `verdict=REWRITE` **不是 ESCALATED**——它们是正常档位决策，orchestrator 按分档路由。
+
+## 不越界（红线）
+
+- 不改 `pipeline/scenes/scene_{scene_id}.md` / scene_card / role_briefs / 任何上游文件
+- 不对 `scene_id=null` 的全文级 finding 做归属猜测
+- 不对其他场景做评审——一个 scene-reviewer dispatch 只负责一个 scene_id
+- 不加载其他 skill 做风格重构（可按需读 `dialogue-craft` / `prose-craft` 的具体原则参考，但通过运行时 skill 入口加载，不 Read）
+- 不写 patch_directive 时"创造"新 issue——patches 必须基于 A/B/C findings 或 lint hits 有据可查
+- 不在 scene_{id}.yaml / patch_directive.yaml 之外写任何文件
+
+## Fresh session 约定
+
+- 每次 dispatch = fresh session（对齐 writer / reviser）
+- 不读其他场景的 scene_{id}.yaml（都是独立决策）
+- PATCH → reviser 改 → 下一轮 orchestrator 再次评审时，新的 scene-reviewer 看到的已是**新的 scene_{id}.yaml 不存在 + 已被 reviser Edit 过的 `pipeline/scenes/scene_{scene_id}.md` 当前版**（orchestrator 清理历史的责任）；当前 scope 每场景仅跑一次正常流程
+
+## 减法哲学（与 reviser 一致）
+
+- 默认做减法——PATCH 档的 suggested_action 优先 "删" 而非 "改写" 或 "加更长版本"
+- 模糊定位的 finding（"某段末尾有问题" 没给具体句） → 不进 patch_directive；在 rationale 里注明"不可定点修"；若这类占大多数 → 升档 ROLLBACK
+- 不追求华丽，只追求聚焦
