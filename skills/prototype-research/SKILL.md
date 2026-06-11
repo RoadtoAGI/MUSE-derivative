@@ -63,70 +63,16 @@ description: MUSE 写作前置调研层 — 调用方传入原型描述 + reuse_
 
 仅产 card。调用方走 inspiration_ledger 软约束注入路径。
 
-### reuse_mode=fan_fiction
+### 衍生四档（fan_fiction / sequel / spin_off / cross_style_rewrite）
 
-产 card + reuse_profile + seeds/phase0_1_2 + text/continuity_anchors（推荐加 text/style_fewshot_notes）。
+执行对应模式前 Read 该模式的执行细则文件，再按其产物清单与 phase_execution_plan 执行：
 
-`reuse_profile.yaml.phase_execution_plan`：
-- phase0/1/2: `instantiate`
-- phase3/4/5: `rebuild`
-- phase6: `write_full`
-- phase7: 常规
-
-canon 路径反推 seeds：
-- phase0 seed ← novel-analysis 输出的 `controlling_idea` + `genre` + `premise`
-- phase1 seed ← novel-analysis 输出的 `world_rules` + design-doc-reference 的世界设定档案
-- phase2 seed ← character-kb-distill 输出的角色档案（按用户 query 涉及的角色组合）
-
-web 路径反推 seeds：通常仅能产 phase0 + phase1 部分；phase2 角色档案需手工 paraphrase。降级标 `seed_quality: partial`。
-
-### reuse_mode=sequel
-
-产 card + reuse_profile + seeds/phase0-5 + text/continuity_anchors + text/tail_window_summary。
-
-`reuse_profile.yaml.phase_execution_plan`：
-- phase0/1/2: `instantiate`
-- phase3/4/5: `append_edit`（含 `continuation_point` + `unresolved_threads` + `append_constraints`）
-- phase6: `new_scenes_only`
-- phase7: `continuity_review`
-
-canon 路径反推 phase3-5 seeds：
-- phase3 seed `inherited_spine` ← novel-analysis 输出的 spine 段
-- phase3 seed `continuation_point` ← 用户 query（如"续第 N 章"或"接结尾"）
-- phase3 seed `unresolved_threads` ← scene-reference 检索原作结尾 N 章 + character-kb-distill 角色未达成欲望
-- phase4 seed `inherited_structure` + `append_target` ← novel-analysis 结构段
-- phase5 seed `inherited_scenes` + `new_scene_slots` ← scene-reference 原场景索引
-- text/tail_window_summary ← scene-reference 原作结尾几场状态
-
-web 路径下 sequel：原则上不推荐（资料粒度不足）；如必须，仅产 reference_only 降级 + 在 sources 标 `degraded_from: sequel`。
-
-### reuse_mode=spin_off
-
-产 card + reuse_profile + seeds/phase0_1 + seeds/phase2（标 partial，含 `role_promotion` 段）+ text/continuity_anchors。
-
-`reuse_profile.yaml.phase_execution_plan`：
-- phase0/1: `instantiate`
-- phase2: `role_promotion`（详 phase2-character SKILL.md 内 role_promotion mode 段）
-- phase3/4/5: `rebuild`
-- phase6: `write_full`
-- phase7: `continuity_review`（轻量，只检查不破坏 canon）
-
-canon 路径反推 phase2 seed：
-- `canonical_protagonist` ← character-kb-distill 原主角档案 + `role_in_spin_off` 字段（background / supporting / cameo 由用户 query 决定）
-- `role_promotion` ← character-kb-distill 升格的原配角档案 + 用户 query 暗示的 expanded conflicts
-
-### reuse_mode=cross_style_rewrite
-
-产 card + reuse_profile + seeds/phase0-5 + text/scene_map（推荐加 text/continuity_anchors 沿用专名）。
-
-`reuse_profile.yaml.phase_execution_plan`：
-- phase0-5: `locked`（不重新生成 `pipeline/phase{N}_*.yaml`；下游直接读 seed）
-- phase6: `rewrite_only`
-- phase7: 风格一致性 + 信息保真审查
-
-canon 路径反推 text/scene_map：
-- 每个场景的 `scene_function` + `canon_facts` ← scene-reference 输出
-- `rewrite_policy.style_target` ← 用户 query（如"轻喜剧"、"赛博朋克"、"鲁迅式"）
+| reuse_mode | 执行细则 |
+|---|---|
+| fan_fiction | [references/reuse-mode-fan-fiction.md](references/reuse-mode-fan-fiction.md) |
+| sequel | [references/reuse-mode-sequel.md](references/reuse-mode-sequel.md) |
+| spin_off | [references/reuse-mode-spin-off.md](references/reuse-mode-spin-off.md) |
+| cross_style_rewrite | [references/reuse-mode-cross-style-rewrite.md](references/reuse-mode-cross-style-rewrite.md) |
 
 ## §4. canon 路径
 
