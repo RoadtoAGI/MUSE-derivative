@@ -139,10 +139,12 @@ DEVICE_BUDGET_CLASSES: dict[str, dict[str, float]] = {
     },
 }
 
-# KB 名著语料 shadow 校准基线（hits density per 1k chars 的 P90）：
+# KB 名著语料 shadow 校准基线（hits per 1k chars 的 P90，en 与 zh 同字符口径，
+# 与 aggregate_cluster_alerts 的 density 分母一致）：
 # cluster alert 仅当 family 密度超过本表基线才生效（count 证据路径保留为前置），
 # 表内无该 family / 无该语言 → 基线 0，行为不变。
-# en 语料样本不足（<15 scene / family），按"en S 级先窄后宽"暂不设基线。
+# en 基线源自 I Am Legend 10 个正文场景（排除 scenes/ 下 _craft.md 旁注）；
+# 仅设有金标数据的 family，其余 family 无数据不抑制（先窄后宽）。
 FAMILY_DENSITY_BASELINE: dict[str, dict[str, float]] = {
     "zh": {
         "abstract_phrase_debt": 0.48,
@@ -160,7 +162,12 @@ FAMILY_DENSITY_BASELINE: dict[str, dict[str, float]] = {
         "social_choreography": 0.69,
         "state_persistence_template": 0.38,
     },
-    "en": {},
+    "en": {
+        "contrastive_negation_assertion": 0.48,
+        "dash_overuse": 0.27,
+        "marker_pollution": 0.14,
+        "rhythm_fragmentation": 0.82,
+    },
 }
 
 FAMILY_SOVEREIGNTY: dict[str, str] = {

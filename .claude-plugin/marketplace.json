@@ -5,14 +5,14 @@
   },
   "metadata": {
     "description": "MUSE 衍生写作姊妹包 — 同人 / 续写 / 番外 / 跨风格改编。与 muse-writing 主干几乎一致，唯一区别是跑 pipeline 前预置可继承的 phase 设计 yaml、phase1-5 在其上完善；自含整条衍生 pipeline，可选依赖 muse-canon-distill",
-    "version": "0.3.1"
+    "version": "0.3.2"
   },
   "plugins": [
     {
       "name": "muse-derivative",
       "source": "./",
       "description": "入口 derivative-writing（同人 / 续写 / 外传 / 跨文风改编）× deliverable_type（角色档案 / 情节框架 / 大纲 / 正文 / prose 重写）。执行模型与 muse-writing 几乎一致：第一步 init_derivative_run.py 按 reuse_mode 把原作可继承的 phaseN 设计 yaml 从 canon 蒸馏物 / 用户已有 pipeline 预置到 work_dir（fan_fiction/spin_off 预置 phase1-2、sequel 预置 phase1-5、cross_style 预置 phase0-5）；随后跑 phase0-7，phase1-5 检测到已有 yaml 就在其上完善（否则从零生成），下游 phase6 写正文 / phase7 整合的消费逻辑与 muse-writing 一致。包内自含 phase0-7 + writer/prose-craft/review 等全套 pipeline skill",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "strict": false
     }
   ]
