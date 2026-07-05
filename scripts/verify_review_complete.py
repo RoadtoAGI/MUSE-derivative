@@ -98,6 +98,17 @@ def _check_lint_ledger(review_dir: Path, scene_id: str, verdict: str, yaml_modul
     """Rn+2 O3: ledger hard gate + malformed YAML 处理。
     Returns: (is_hard_fail, reason)。is_hard_fail=False 且 reason 非空 -> WARN advisory。
     """
+    machine_ledger_path = review_dir / f"{scene_id}.machine_ledger.yaml"
+    if machine_ledger_path.exists():
+        try:
+            machine_ledger = yaml_module.safe_load(
+                machine_ledger_path.read_text(encoding="utf-8")
+            ) or {}
+        except yaml_module.YAMLError as exc:
+            return True, f"{scene_id}: machine_ledger malformed YAML — hard fail: {exc}"
+        if isinstance(machine_ledger.get("entries"), list):
+            return False, ""
+
     ledger_path = review_dir / f"scene_{scene_id}.lint_resolution_ledger.yaml"
     requires_hard = (
         verdict in {"PATCH", "ROLLBACK", "REWRITE"}
@@ -127,6 +138,52 @@ def _check_lint_ledger(review_dir: Path, scene_id: str, verdict: str, yaml_modul
     if updates is not None and not isinstance(updates, (dict, list)):
         return True, f"scene_{scene_id}: post_revision_updates 格式异常 — hard fail"
 
+    return False, ""
+
+
+def _check_machine_channel(review_dir: Path, scene_id: str, yaml_module) -> tuple[bool, str]:
+    directive_path = review_dir / f"{scene_id}.machine_directive.yaml"
+    if not directive_path.exists():
+        return False, ""
+
+    try:
+        directive = yaml_module.safe_load(directive_path.read_text(encoding="utf-8")) or {}
+    except yaml_module.YAMLError as exc:
+        return True, f"{scene_id}: machine_directive malformed YAML — hard fail: {exc}"
+
+    pending_ids = [
+        entry.get("id")
+        for entry in directive.get("entries", []) or []
+        if isinstance(entry, dict) and entry.get("status") == "pending" and entry.get("id")
+    ]
+    if not pending_ids:
+        return False, ""
+
+    gate_path = review_dir / f"{scene_id}.distribution_gate.yaml"
+    if gate_path.exists():
+        try:
+            gate = yaml_module.safe_load(gate_path.read_text(encoding="utf-8")) or {}
+        except yaml_module.YAMLError as exc:
+            return True, f"{scene_id}: distribution_gate malformed YAML — hard fail: {exc}"
+        if gate.get("verdict") == "PASS":
+            return False, ""
+
+    ledger_path = review_dir / f"{scene_id}.machine_ledger.yaml"
+    ledger_status_by_id = {}
+    if ledger_path.exists():
+        try:
+            ledger = yaml_module.safe_load(ledger_path.read_text(encoding="utf-8")) or {}
+        except yaml_module.YAMLError as exc:
+            return True, f"{scene_id}: machine_ledger malformed YAML — hard fail: {exc}"
+        ledger_status_by_id = {
+            entry.get("id"): entry.get("status")
+            for entry in ledger.get("entries", []) or []
+            if isinstance(entry, dict) and entry.get("id")
+        }
+
+    blocking = [entry_id for entry_id in pending_ids if ledger_status_by_id.get(entry_id) != "escalated"]
+    if blocking:
+        return True, f"{scene_id}: machine directive pending 未消费: {blocking}"
     return False, ""
 
 
@@ -172,6 +229,7 @@ def check(work_dir: Path) -> int:
     rollback_no_post_revision: list[tuple[str, str]] = []
     ai_gate_unclosed: list[tuple[str, str]] = []
     ledger_hard_fail: list[tuple[str, str]] = []
+    machine_channel_unclosed: list[tuple[str, str]] = []
     post_revision_pass_unclosed: list[tuple[str, str]] = []
 
     for sid in scene_ids:
@@ -205,6 +263,11 @@ def check(work_dir: Path) -> int:
         hard_fail, reason = _check_lint_ledger(review_dir, sid, verdict, yaml)
         if hard_fail:
             ledger_hard_fail.append((sid, reason))
+            continue
+
+        hard_fail, reason = _check_machine_channel(review_dir, sid, yaml)
+        if hard_fail:
+            machine_channel_unclosed.append((sid, reason))
             continue
 
         if verdict == "PATCH":
@@ -298,6 +361,7 @@ def check(work_dir: Path) -> int:
         and not rollback_no_post_revision
         and not ai_gate_unclosed
         and not ledger_hard_fail
+        and not machine_channel_unclosed
         and not post_revision_pass_unclosed
     ):
         return 0  # §1.5 完整，放行
@@ -357,6 +421,8 @@ def check(work_dir: Path) -> int:
         )
     if ledger_hard_fail:
         detail.append(f"ledger hard fail: {ledger_hard_fail}")
+    if machine_channel_unclosed:
+        detail.append(f"machine channel 未闭合: {machine_channel_unclosed}")
     if post_revision_pass_unclosed:
         detail.append(f"post-revision PASS 准入未闭合: {post_revision_pass_unclosed}")
 

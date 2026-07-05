@@ -58,6 +58,10 @@ RULE_TO_FAMILY = {
     "ordinal_gravity_marker": "micro_punchline_cadence",
     "zero_yield_micro_clause_candidate": "micro_punchline_cadence",
     "state_persistence_tag": "state_persistence_template",
+    "em_dash_density": "dash_overuse",
+    "negation_pivot_en": "contrastive_negation_assertion",
+    "staccato_run": "rhythm_fragmentation",
+    "simile_density_en": "figurative_debt",
 }
 
 
@@ -88,6 +92,14 @@ class Thresholds:
     micro_action_min_paragraph_chars: int = 80
     micro_action_count_gte: int = 5
     micro_action_unique_gte: int = 3
+    # English profile
+    en_em_dash_paragraph_min_words: int = 30
+    en_em_dash_medium_gte: int = 2
+    en_em_dash_high_gte: int = 3
+    en_em_dash_per_1k_words_gte: float = 4.0
+    en_staccato_sentence_max_words: int = 4
+    en_staccato_run_gte: int = 3
+    en_simile_per_1k_words_gte: float = 5.0
 
 
 _THRESHOLD_PROFILES = {
@@ -106,6 +118,66 @@ _THRESHOLD_PROFILES = {
         micro_action_min_paragraph_chars=60,
         micro_action_count_gte=4,
     ),
+}
+
+DEVICE_BUDGET_CLASSES: dict[str, dict[str, float]] = {
+    # 乘数 = KB 名著基线 P90/P80（round 到 0.1）——装置声明把该 family 的
+    # 容忍度从基线 P90 放宽到 P90 × 乘数。
+    "naked_line": {
+        "micro_punchline_cadence": 1.6,
+        "silence_pause_cliche": 1.3,
+    },
+    "storyteller_voice": {
+        "lexical_cliche": 1.3,
+    },
+    "staccato_action": {
+        "rhythm_fragmentation": 1.6,
+        "micro_punchline_cadence": 1.6,
+    },
+    "archive_cold": {
+        "rhythm_fragmentation": 1.6,
+    },
+}
+
+# KB 名著语料 shadow 校准基线（hits density per 1k chars 的 P90）：
+# cluster alert 仅当 family 密度超过本表基线才生效（count 证据路径保留为前置），
+# 表内无该 family / 无该语言 → 基线 0，行为不变。
+# en 语料样本不足（<15 scene / family），按"en S 级先窄后宽"暂不设基线。
+FAMILY_DENSITY_BASELINE: dict[str, dict[str, float]] = {
+    "zh": {
+        "abstract_phrase_debt": 0.48,
+        "action_log": 0.39,
+        "connector_overuse": 0.78,
+        "contrastive_negation_assertion": 0.63,
+        "dash_overuse": 0.26,
+        "figurative_debt": 0.40,
+        "lexical_cliche": 3.75,
+        "marker_pollution": 1.72,
+        "micro_punchline_cadence": 7.05,
+        "repeated_head": 0.70,
+        "rhythm_fragmentation": 4.00,
+        "silence_pause_cliche": 0.72,
+        "social_choreography": 0.69,
+        "state_persistence_template": 0.38,
+    },
+    "en": {},
+}
+
+FAMILY_SOVEREIGNTY: dict[str, str] = {
+    "marker_pollution": "S",
+    "lexical_cliche": "S",
+    "connector_overuse": "S",
+    "rhythm_fragmentation": "S",
+    "repeated_head": "S",
+    "action_log": "M",
+    "dash_overuse": "S",
+    "figurative_debt": "M",
+    "abstract_phrase_debt": "M",
+    "silence_pause_cliche": "M",
+    "social_choreography": "M",
+    "contrastive_negation_assertion": "M",
+    "micro_punchline_cadence": "S",
+    "state_persistence_template": "M",
 }
 
 KEYWORD_CLICHE_PATTERNS = [
@@ -214,6 +286,39 @@ MARKDOWN_PATTERNS = [
 
 def _locate(text: str, pos: int) -> str:
     return f"L{text.count(chr(10), 0, pos) + 1}"
+
+
+def detect_lang(text: str) -> str:
+    compact = re.sub(r"\s+", "", text)
+    if not compact:
+        return "zh"
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", compact))
+    return "zh" if cjk / len(compact) > 0.3 else "en"
+
+
+def _normalize_lang(text: str, lang: str) -> str:
+    if lang == "auto":
+        return detect_lang(text)
+    if lang not in {"zh", "en"}:
+        raise ValueError(f"Unsupported lang: {lang}")
+    return lang
+
+
+def _resolve_device_budget(devices: Iterable[str]) -> tuple[dict[str, float], list[str]]:
+    multipliers: dict[str, float] = {}
+    valid_devices: list[str] = []
+    for raw_device in devices:
+        device = str(raw_device).strip()
+        if not device:
+            continue
+        budget = DEVICE_BUDGET_CLASSES.get(device)
+        if budget is None:
+            print(f"[ai_filler_lint] WARN: unknown literary_device ignored: {device}", file=sys.stderr)
+            continue
+        valid_devices.append(device)
+        for family, multiplier in budget.items():
+            multipliers[family] = max(multipliers.get(family, 1.0), multiplier)
+    return multipliers, valid_devices
 
 
 def detect_keyword_cliche(text: str, whitelist: Iterable[str] = ()) -> list[dict]:
@@ -1203,11 +1308,157 @@ def detect_banned_markdown(text: str) -> list[dict]:
     return hits
 
 
+EN_WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
+
+
+def _en_words(text: str) -> list[str]:
+    return EN_WORD_RE.findall(text)
+
+
+def detect_em_dash_density_en(text: str, thresholds: Thresholds | None = None) -> list[dict]:
+    t = thresholds or Thresholds()
+    hits = []
+    family = RULE_TO_FAMILY["em_dash_density"]
+    total_words = max(len(_en_words(text)), 1)
+    total_dashes = text.count("—")
+    per_1k = total_dashes / total_words * 1000
+
+    for m in re.finditer(r'[^\n]+(?:\n(?![ \t]*\n)[^\n]+)*', text):
+        para = m.group()
+        word_count = len(_en_words(para))
+        dash_count = para.count("—")
+        if word_count < t.en_em_dash_paragraph_min_words or dash_count < t.en_em_dash_medium_gte:
+            continue
+        severity = "high" if dash_count >= t.en_em_dash_high_gte else "medium"
+        hits.append({
+            "rule": "em_dash_density",
+            "family": family,
+            "group": FAMILY_GROUPS[family],
+            "cluster": FAMILY_CLUSTERS[family],
+            "pattern": f"em_dash_density×{dash_count}",
+            "location": _locate(text, m.start()),
+            "snippet": para[:100].replace("\n", " "),
+            "confidence": "high",
+            "severity": severity,
+            "details": {"dash_count": dash_count, "word_count": word_count},
+        })
+
+    if per_1k > t.en_em_dash_per_1k_words_gte and total_dashes:
+        hits.append({
+            "rule": "em_dash_density",
+            "family": family,
+            "group": FAMILY_GROUPS[family],
+            "cluster": FAMILY_CLUSTERS[family],
+            "pattern": "em_dash_per_1k_words",
+            "location": "L1",
+            "snippet": text[:100].replace("\n", " "),
+            "confidence": "high",
+            "severity": "high",
+            "details": {"dash_count": total_dashes, "em_dash_per_1k_words": round(per_1k, 2)},
+        })
+    return hits
+
+
+def detect_negation_pivot_en(text: str) -> list[dict]:
+    family = RULE_TO_FAMILY["negation_pivot_en"]
+    hits = []
+    patterns = [
+        re.compile(r"\bNot\s+[^.—!?]{2,40}\s*[—.]\s*(?:[A-Za-z]|but\b|it was\b)", re.IGNORECASE),
+        re.compile(r"\bnot because\b.{3,40},\s*but because\b", re.IGNORECASE),
+    ]
+    for pattern in patterns:
+        for m in pattern.finditer(text):
+            hits.append({
+                "rule": "negation_pivot_en",
+                "family": family,
+                "group": FAMILY_GROUPS[family],
+                "cluster": FAMILY_CLUSTERS[family],
+                "pattern": "not_x_pivot",
+                "location": _locate(text, m.start()),
+                "snippet": m.group(0)[:100].replace("\n", " "),
+                "confidence": "medium",
+                "severity": "medium",
+                "start": m.start(),
+                "end": m.end(),
+            })
+    return hits
+
+
+def detect_staccato_run_en(text: str, thresholds: Thresholds | None = None) -> list[dict]:
+    t = thresholds or Thresholds()
+    family = RULE_TO_FAMILY["staccato_run"]
+    hits = []
+    sentence_matches = list(re.finditer(r"[^.!?\n]+[.!?]", text))
+    run: list[re.Match[str]] = []
+    for match in sentence_matches:
+        word_count = len(_en_words(match.group()))
+        if 0 < word_count <= t.en_staccato_sentence_max_words:
+            run.append(match)
+            continue
+        if len(run) >= t.en_staccato_run_gte:
+            first = run[0]
+            snippet = " ".join(m.group().strip() for m in run)
+            hits.append({
+                "rule": "staccato_run",
+                "family": family,
+                "group": FAMILY_GROUPS[family],
+                "cluster": FAMILY_CLUSTERS[family],
+                "pattern": f"short_sentence_run×{len(run)}",
+                "location": _locate(text, first.start()),
+                "snippet": snippet[:100],
+                "confidence": "medium",
+                "severity": "medium",
+                "start": first.start(),
+                "end": run[-1].end(),
+            })
+        run = []
+    if len(run) >= t.en_staccato_run_gte:
+        first = run[0]
+        snippet = " ".join(m.group().strip() for m in run)
+        hits.append({
+            "rule": "staccato_run",
+            "family": family,
+            "group": FAMILY_GROUPS[family],
+            "cluster": FAMILY_CLUSTERS[family],
+            "pattern": f"short_sentence_run×{len(run)}",
+            "location": _locate(text, first.start()),
+            "snippet": snippet[:100],
+            "confidence": "medium",
+            "severity": "medium",
+            "start": first.start(),
+            "end": run[-1].end(),
+        })
+    return hits
+
+
+def detect_simile_density_en(text: str, thresholds: Thresholds | None = None) -> list[dict]:
+    t = thresholds or Thresholds()
+    family = RULE_TO_FAMILY["simile_density_en"]
+    matches = list(re.finditer(r"\b(like|as if|as though)\b", text, flags=re.IGNORECASE))
+    word_count = max(len(_en_words(text)), 1)
+    per_1k = len(matches) / word_count * 1000
+    if per_1k <= t.en_simile_per_1k_words_gte:
+        return []
+    return [{
+        "rule": "simile_density_en",
+        "family": family,
+        "group": FAMILY_GROUPS[family],
+        "cluster": FAMILY_CLUSTERS[family],
+        "pattern": "simile_per_1k_words",
+        "location": _locate(text, matches[0].start()) if matches else "L1",
+        "snippet": text[:100].replace("\n", " "),
+        "confidence": "medium",
+        "severity": "medium",
+        "details": {"simile_count": len(matches), "simile_per_1k_words": round(per_1k, 2)},
+    }]
+
+
 SEMANTIC_CLUSTERS = {
     "figurative_debt",
     "abstract_explanation",
     "silence_pause_cliche",
     "social_choreography",
+    "explanatory_detour",
 }
 SYNTAX_CLUSTERS = {"rhythm_fragmentation", "action_log"}
 FAMILY_GROUP_ORDER = {"hard": 1, "syntax_heuristic": 2, "semantic_heuristic": 3}
@@ -1531,8 +1782,16 @@ def _ensure_lint_ids(hits: list[dict], scene_id: str) -> list[dict]:
     return hits
 
 
-def aggregate_cluster_alerts(hits: list[dict], scene_id: str, scene_text: str) -> list[dict]:
+def aggregate_cluster_alerts(
+    hits: list[dict],
+    scene_id: str,
+    scene_text: str,
+    budget_multipliers: dict[str, float] | None = None,
+    *,
+    lang: str = "zh",
+) -> list[dict]:
     apply_canonical_dedup(hits)  # Rn+2 O4: in-place 标记 supporting hits
+    budget_multipliers = budget_multipliers or {}
 
     by_family: dict[str, list[dict]] = {}
     for hit in hits:
@@ -1550,6 +1809,14 @@ def aggregate_cluster_alerts(hits: list[dict], scene_id: str, scene_text: str) -
     char_k = max(len(scene_text) / 1000, 0.001)
     for family, family_hits in by_family.items():
         thresholds = {**STRICT_PROFILE, **PER_FAMILY_OVERRIDE.get(family, {})}
+        multiplier = budget_multipliers.get(family, 1.0)
+        if multiplier > 1.0:
+            thresholds = {
+                key: value * multiplier
+                if isinstance(value, (int, float)) and key.endswith(("_gte", "_count_gte"))
+                else value
+                for key, value in thresholds.items()
+            }
         rule_counts = Counter(hit.get("rule", "unknown") for hit in family_hits)
         total_count = len(family_hits)
         density = total_count / char_k
@@ -1571,6 +1838,12 @@ def aggregate_cluster_alerts(hits: list[dict], scene_id: str, scene_text: str) -
             )
         )
         if not triggered:
+            continue
+        # 名著基线 AND gate：count 证据成立后，密度还须超过 KB 校准基线（P90 × 装置乘数）
+        # 才升级为 cluster alert——保护高风格化合法形态（说书腔 / 动作短切 / 克制裸句）。
+        # hits 本身不受影响，仍全量落盘可观测。
+        baseline = FAMILY_DENSITY_BASELINE.get(lang, {}).get(family, 0.0) * multiplier
+        if baseline and density < baseline:
             continue
         registry = FAMILY_REGISTRY.get(family, {})
         distribution = compute_distribution_mode(family_hits, scene_text)
@@ -1603,6 +1876,7 @@ def aggregate_cluster_alerts(hits: list[dict], scene_id: str, scene_text: str) -
             "supporting_hit_ids": supporting_hit_ids,
             "distribution": distribution,
             "severity": severity,
+            "budget_multiplier": multiplier,
             "governance": {
                 "individual_exemption_allowed": False,
                 "required_triage": "cluster_finding",
@@ -1658,35 +1932,53 @@ def check_low_information_cadence(
     }
 
 
+RULES_ZH = (
+    lambda text, whitelist, thresholds: detect_keyword_cliche(text, whitelist),
+    lambda text, whitelist, thresholds: detect_conjunction_overuse(text),
+    lambda text, whitelist, thresholds: detect_parallel_negation(text),
+    lambda text, whitelist, thresholds: detect_contrastive_negation_assertion(text),
+    lambda text, whitelist, thresholds: detect_narrative_micro_label(text),
+    lambda text, whitelist, thresholds: detect_counted_speech_weight(text),
+    lambda text, whitelist, thresholds: detect_ordinal_gravity_marker(text),
+    lambda text, whitelist, thresholds: detect_state_persistence_tag(text),
+    lambda text, whitelist, thresholds: detect_zero_yield_micro_clause_candidate(text),
+    lambda text, whitelist, thresholds: detect_short_paragraph_run(text, thresholds),
+    lambda text, whitelist, thresholds: detect_clause_fragment_density(text, thresholds),
+    lambda text, whitelist, thresholds: detect_comma_short_interval(text, thresholds),
+    lambda text, whitelist, thresholds: detect_dash_density(text, thresholds),
+    lambda text, whitelist, thresholds: detect_repeated_clause_head(text, thresholds),
+    lambda text, whitelist, thresholds: detect_micro_action_density(text, thresholds),
+    lambda text, whitelist, thresholds: detect_consecutive_action_phrase(text, thresholds),
+    lambda text, whitelist, thresholds: detect_social_choreography_log(text, thresholds),
+    lambda text, whitelist, thresholds: detect_short_simile_debt(text, thresholds),
+    lambda text, whitelist, thresholds: detect_abstract_phrase_debt(text, thresholds),
+    lambda text, whitelist, thresholds: detect_stock_silence_pause_phrase(text, thresholds),
+    lambda text, whitelist, thresholds: detect_banned_markdown(text),
+)
+
+RULES_EN = (
+    lambda text, whitelist, thresholds: detect_em_dash_density_en(text, thresholds),
+    lambda text, whitelist, thresholds: detect_negation_pivot_en(text),
+    lambda text, whitelist, thresholds: detect_staccato_run_en(text, thresholds),
+    lambda text, whitelist, thresholds: detect_simile_density_en(text, thresholds),
+    lambda text, whitelist, thresholds: detect_banned_markdown(text),
+)
+
+
 def collect_lint_hits(
     text: str,
     whitelist: Iterable[str] = (),
     thresholds: Thresholds | None = None,
+    *,
+    lang: str = "zh",
 ) -> list[dict]:
     t = thresholds or Thresholds()
-    return (
-        detect_keyword_cliche(text, whitelist)
-        + detect_conjunction_overuse(text)
-        + detect_parallel_negation(text)
-        + detect_contrastive_negation_assertion(text)
-        + detect_narrative_micro_label(text)
-        + detect_counted_speech_weight(text)
-        + detect_ordinal_gravity_marker(text)
-        + detect_state_persistence_tag(text)
-        + detect_zero_yield_micro_clause_candidate(text)
-        + detect_short_paragraph_run(text, t)
-        + detect_clause_fragment_density(text, t)
-        + detect_comma_short_interval(text, t)
-        + detect_dash_density(text, t)
-        + detect_repeated_clause_head(text, t)
-        + detect_micro_action_density(text, t)
-        + detect_consecutive_action_phrase(text, t)
-        + detect_social_choreography_log(text, t)
-        + detect_short_simile_debt(text, t)
-        + detect_abstract_phrase_debt(text, t)
-        + detect_stock_silence_pause_phrase(text, t)
-        + detect_banned_markdown(text)
-    )
+    selected_lang = _normalize_lang(text, lang)
+    rules = RULES_EN if selected_lang == "en" else RULES_ZH
+    hits: list[dict] = []
+    for rule in rules:
+        hits.extend(rule(text, whitelist, t))
+    return hits
 
 
 def run_ai_filler_lint(
@@ -1694,9 +1986,19 @@ def run_ai_filler_lint(
     scene_id: str = "S01",
     whitelist: Iterable[str] = (),
     thresholds: Thresholds | None = None,
+    *,
+    lang: str = "zh",
+    devices: Iterable[str] = (),
 ) -> dict:
-    lint_hits = _ensure_lint_ids(collect_lint_hits(scene_text, whitelist, thresholds), scene_id)
-    cluster_alerts = aggregate_cluster_alerts(lint_hits, scene_id, scene_text)
+    selected_lang = _normalize_lang(scene_text, lang)
+    budget_multipliers, valid_devices = _resolve_device_budget(devices)
+    lint_hits = _ensure_lint_ids(
+        collect_lint_hits(scene_text, whitelist, thresholds, lang=selected_lang),
+        scene_id,
+    )
+    cluster_alerts = aggregate_cluster_alerts(
+        lint_hits, scene_id, scene_text, budget_multipliers, lang=selected_lang
+    )
     zero_yield_hits = [
         hit for hit in lint_hits
         if hit.get("rule") == "zero_yield_micro_clause_candidate"
@@ -1706,6 +2008,10 @@ def run_ai_filler_lint(
         "lint_hits": lint_hits,
         "cluster_alerts": cluster_alerts,
         "scene_level_issues": [low_information] if low_information else [],
+        "language": selected_lang,
+        "device_budget_applied": bool(valid_devices),
+        "budget_class": valid_devices,
+        "budget_source": "declared" if valid_devices else "default",
     }
 
 
@@ -1713,9 +2019,20 @@ def analyze(
     text: str,
     whitelist: Iterable[str] = (),
     thresholds: Thresholds | None = None,
+    *,
+    scene_id: str = "S01",
+    lang: str = "zh",
+    devices: Iterable[str] = (),
 ) -> dict:
-    all_hits = _ensure_lint_ids(collect_lint_hits(text, whitelist, thresholds), "S01")
-    cluster_alerts = aggregate_cluster_alerts(all_hits, "S01", text)
+    selected_lang = _normalize_lang(text, lang)
+    budget_multipliers, valid_devices = _resolve_device_budget(devices)
+    all_hits = _ensure_lint_ids(
+        collect_lint_hits(text, whitelist, thresholds, lang=selected_lang),
+        scene_id,
+    )
+    cluster_alerts = aggregate_cluster_alerts(
+        all_hits, scene_id, text, budget_multipliers, lang=selected_lang
+    )
     zero_yield_hits = [
         hit for hit in all_hits
         if hit.get("rule") == "zero_yield_micro_clause_candidate"
@@ -1724,6 +2041,10 @@ def analyze(
     pattern_counter = Counter(h["pattern"] for h in all_hits)
     total_chars = len(text)
     return {
+        "language": selected_lang,
+        "device_budget_applied": bool(valid_devices),
+        "budget_class": valid_devices,
+        "budget_source": "declared" if valid_devices else "default",
         "hits": all_hits,
         "cluster_alerts": cluster_alerts,
         "scene_level_issues": [low_information] if low_information else [],
@@ -1742,11 +2063,92 @@ def analyze(
     }
 
 
+def _phase0_language(work_dir: Path) -> str | None:
+    path = work_dir / "pipeline" / "phase0_conception.yaml"
+    if not path.exists():
+        return None
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    candidates = [data.get("language")]
+    phase0 = data.get("phase0")
+    if isinstance(phase0, dict):
+        candidates.append(phase0.get("language"))
+    for value in candidates:
+        if value in {"zh", "en"}:
+            return value
+    return None
+
+
+def _resolve_lang(text: str, cli_lang: str, work_dir: Path | None = None) -> tuple[str, str]:
+    if work_dir is not None:
+        field_lang = _phase0_language(work_dir)
+        if field_lang:
+            if cli_lang != "auto" and cli_lang != field_lang:
+                print(
+                    f"[ai_filler_lint] WARN: --lang {cli_lang} conflicts with phase0.language {field_lang}; using field",
+                    file=sys.stderr,
+                )
+            return field_lang, "field"
+    if cli_lang != "auto":
+        return cli_lang, "cli"
+    return detect_lang(text), "auto"
+
+
+def _coerce_devices(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    return []
+
+
+def _devices_for_scene(work_dir: Path, scene_id: str) -> list[str]:
+    path = work_dir / "pipeline" / "phase5_scenes.yaml"
+    if not path.exists():
+        return []
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError:
+        return []
+
+    candidates = []
+    if isinstance(data, dict):
+        for key in ("scenes", "scene_cards", "phase5_scenes"):
+            value = data.get(key)
+            if isinstance(value, (dict, list)):
+                candidates.append(value)
+        candidates.append(data)
+    elif isinstance(data, list):
+        candidates.append(data)
+
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            scene = candidate.get(scene_id) or candidate.get(f"scene_{scene_id}")
+            if isinstance(scene, dict):
+                return _coerce_devices(scene.get("literary_device"))
+        if isinstance(candidate, list):
+            for scene in candidate:
+                if not isinstance(scene, dict):
+                    continue
+                sid = scene.get("scene_id") or scene.get("id") or scene.get("scene")
+                if sid in {scene_id, f"scene_{scene_id}"}:
+                    return _coerce_devices(scene.get("literary_device"))
+    return []
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="S1 AI filler lint")
     parser.add_argument("scene_file", nargs="?", type=Path, help="可选：直接 lint 单个 scene markdown 文件")
+    parser.add_argument("--scene-path", default=None, type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--scene-id", default=None)
     parser.add_argument("--work-dir", default=None, type=Path)
+    parser.add_argument("--lang", default="auto", choices=["auto", "zh", "en"])
     parser.add_argument("--whitelist-patterns", default="", help="逗号分隔")
     parser.add_argument("--genre", default=None)
     parser.add_argument(
@@ -1766,6 +2168,10 @@ def main() -> int:
         help="输出文件名后缀，如 v2 -> {scene_id}.ai_filler.v2.yaml",
     )
     args = parser.parse_args()
+    if args.scene_path is not None:
+        if args.scene_file is not None:
+            parser.error("Use either positional scene_file or --scene-path, not both")
+        args.scene_file = args.scene_path
 
     base = _THRESHOLD_PROFILES[args.threshold_profile]
     if args.thresholds:
@@ -1783,12 +2189,20 @@ def main() -> int:
             return 1
         scene_id = args.scene_id or scene_path.stem.removeprefix("scene_")
         text = scene_path.read_text(encoding="utf-8")
+        lang, lang_source = _resolve_lang(text, args.lang)
         whitelist = [p.strip() for p in args.whitelist_patterns.split(",") if p.strip()]
-        result = run_ai_filler_lint(text, scene_id=scene_id, whitelist=whitelist, thresholds=base)
+        result = run_ai_filler_lint(
+            text,
+            scene_id=scene_id,
+            whitelist=whitelist,
+            thresholds=base,
+            lang=lang,
+        )
         result["density"] = {
             "total_chars": len(text),
             "hits_per_1k": round(len(result["lint_hits"]) / max(len(text), 1) * 1000, 2),
         }
+        result["meta"] = {"lang_source": lang_source}
         suffix = args.output_suffix or "ai_filler"
         out_path = scene_path.with_name(f"{scene_path.stem}_{suffix}.json")
         out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1805,12 +2219,15 @@ def main() -> int:
         return 1
 
     text = scene_path.read_text(encoding="utf-8")
+    lang, lang_source = _resolve_lang(text, args.lang, work_dir)
+    devices = _devices_for_scene(work_dir, args.scene_id)
     whitelist = [p.strip() for p in args.whitelist_patterns.split(",") if p.strip()]
-    result = analyze(text, whitelist, base)
+    result = analyze(text, whitelist, base, scene_id=args.scene_id, lang=lang, devices=devices)
     result["meta"].update({
         "thresholds": asdict(base),
         "threshold_source": args.threshold_profile + ("+overrides" if args.thresholds else ""),
         "genre": args.genre,
+        "lang_source": lang_source,
     })
 
     output = {

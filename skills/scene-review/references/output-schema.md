@@ -102,16 +102,6 @@ pattern_migration_gate:
             verdict: failed
 ```
 
-## ledger 字段扩展
+## 机器台账指针
 
-```yaml
-lint_resolution_ledger:
-  v1_triage: [...]
-  post_revision_updates:
-    - review_round: post_revision_round1
-      source_lint_run_id: ai_filler.v2
-      updates: [...]
-  semantic_migration_state:
-    attempt_count: <int>
-    last_failed_patch_ids: [<patch_id>, ...]
-```
+ai_filler 病灶台账为 `pipeline/review/{scene_id}.machine_ledger.yaml`，schema 权威 = 生成脚本产物本身（entries[].id/family/level/status）；本文件不镜像。旧产物 `lint_resolution_ledger.yaml` 缺 machine ledger 时按其初始 triage 块 + 最后 update 块解释。
