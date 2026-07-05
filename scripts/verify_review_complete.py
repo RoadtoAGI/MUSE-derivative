@@ -141,9 +141,28 @@ def _check_lint_ledger(review_dir: Path, scene_id: str, verdict: str, yaml_modul
     return False, ""
 
 
+def _v1_has_cluster_alerts(review_dir: Path, scene_id: str, yaml_module) -> bool:
+    """只看首版（无后缀）lint：机器通道立案义务以案发时状态为准，v2 修干净不豁免立案。"""
+    lint_path = review_dir / "lint" / f"{scene_id}.ai_filler.yaml"
+    if not lint_path.exists():
+        return False
+    try:
+        data = yaml_module.safe_load(lint_path.read_text(encoding="utf-8")) or {}
+    except yaml_module.YAMLError:
+        return False
+    return bool(data.get("cluster_alerts"))
+
+
 def _check_machine_channel(review_dir: Path, scene_id: str, yaml_module) -> tuple[bool, str]:
     directive_path = review_dir / f"{scene_id}.machine_directive.yaml"
     if not directive_path.exists():
+        # 不立案旁路封堵：v1 lint 已有 cluster alert 而 directive 从未生成 =
+        # 机器通道整条未运转（区别于"立案后 pending 未消费"）——hard fail
+        if _v1_has_cluster_alerts(review_dir, scene_id, yaml_module):
+            return True, (
+                f"{scene_id}: v1 lint 含 cluster_alerts 但 machine_directive.yaml 不存在"
+                "——机器通道未立案（时点① 未执行）"
+            )
         return False, ""
 
     try:
