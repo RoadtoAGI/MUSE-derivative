@@ -60,6 +60,7 @@ RULE_TO_FAMILY = {
     "state_persistence_tag": "state_persistence_template",
     "em_dash_density": "dash_overuse",
     "negation_pivot_en": "contrastive_negation_assertion",
+    "slop_phrase_en": "lexical_cliche",
     "staccato_run": "rhythm_fragmentation",
     "simile_density_en": "figurative_debt",
 }
@@ -1366,12 +1367,89 @@ def detect_em_dash_density_en(text: str, thresholds: Thresholds | None = None) -
     return hits
 
 
+# en 高特异 slop 短语词表（来源 sam-paech/antislop-sampler, Apache-2.0；
+# 取 LLM 过表征频次 >=1000 的短语层条目）。相对过表征条目（人类亦用，如
+# 'took a deep breath'）混在其中——en 处于观测模式，hit 仅记录不立案；
+# 恢复立案前须按金标做条目级误杀清洗。
+SLOP_PHRASES_EN = [
+    'took a deep breath', 'voice barely above a whisper', "couldn't help but feel", 'help but feel a sense',
+    'voice barely audible', 'casting long shadows', 'voice barely a whisper', "couldn't shake the feeling",
+    "couldn't help but wonder", 'long shadows across', 'heart pounding in my chest', 'sun dipped below the horizon',
+    'felt a chill run', 'air was thick with the scent', 'felt like an eternity', 'heart pounding in her chest',
+    'voice steady despite', 'felt a shiver run', 'said, his voice low', 'room fell silent', 'ready to face whatever',
+    'trying to make sense', 'said, his voice barely', 'dipped below the horizon, casting', 'said, her voice barely',
+    'asked, my voice barely', 'deep breath, trying', 'felt a strange sense', 'something else entirely',
+    'could feel the weight', 'words hung in the air', 'heart pounding in his chest', 'brow furrowed in concentration',
+    'sun began to set', 'smile playing on his lips', 'voice trembling slightly', 'asked, her voice barely',
+    'door creaked open', 'eyes never leaving', 'days turned into weeks', 'voice a low rumble', 'growing sense of unease',
+    'took a step back', 'heart skipped a beat', 'air hung thick', 'said, her voice steady', 'rain continued to fall',
+    'sun hung low', 'shiver run down my spine', 'took a step forward', 'said, my voice barely', 'casting a warm glow',
+    'renewed sense of purpose', 'spreading across his face', 'Taking a deep breath', 'horizon, casting long',
+    'hung low in the sky', 'whispered, her voice barely', 'smile spreading across', 'leaned back in his chair',
+    'low in the sky, casting', 'hung heavy in the air', 'eyes wide with fear', 'took a step closer',
+    'shake the feeling that something', 'something else, something', 'face whatever challenges',
+    'one last time', 'spread like wildfire', 'asked, his voice barely', 'road ahead would', 'Days turned into weeks',
+    'felt a sense of peace', 'newfound sense of purpose', 'door swung open', 'grin spreading across',
+    'eyes filled with a mixture', 'said, his voice a low', 'flicker of something akin', 'eyes locked onto',
+    'dimly lit room', 'tried to make sense', 'challenges lay ahead', 'hung in the air, heavy', 'chill run down my spine',
+    'small, intricately carved', 'said, his voice filled', 'eyes darting around', 'said, his voice steady',
+    "couldn't help but notice", 'deep breath, steeling', 'brow furrowed in confusion', 'sent a shiver down my spine',
+    'chill run down her spine', 'would find a way', 'young woman named', 'breath caught in her throat',
+    'fingers flying across', 'eyes wide with wonder', 'Dust motes danced', 'mind raced, trying',
+    'figure emerged from the shadows', 'heart hammered against my ribs', 'turned and walked away',
+    'piercing blue eyes', 'felt a strange sensation', 'small smile playing', 'trying to keep my voice',
+    'felt a cold dread', 'hung thick with the scent', 'air was thick with tension', 'sky, casting long',
+    'would never forget', 'whatever challenges lay', 'mind racing with questions', 'said, trying to sound',
+    'said, her voice trembling', 'gaze sweeping across', 'spent countless hours', 'said, his voice dripping',
+    'resonated deep within', 'first time in a long', 'blood ran cold', 'deep breath, feeling', 'mind racing with the implications',
+    'mind racing with possibilities', 'eyes widened in surprise', 'said, her voice filled', 'eyes wide with a mixture',
+    'smile playing on her lips', 'taking a deep breath', 'could find a way', 'never seen anything',
+    'knew one thing', 'said, my voice steady', 'air thick with the scent', 'eyes scanning the room',
+    'felt a growing sense', 'seen anything like', 'asked, her voice trembling', 'help but feel a twinge',
+    'smile spread across', 'breath caught in my throat', 'heart pounded in my chest', 'feel a sense of unease',
+    'scent of damp earth', 'growing sense of dread', 'looked around the room', 'intricately carved wooden',
+    'raised a hand, silencing', 'began to set, casting', 'sighed, running a hand', 'hand instinctively reaching',
+    'sense of peace wash', 'heart heavy with the weight', 'knew that the road ahead', 'said, her voice soft',
+    'smile tugging at the corners', 'leaned forward, his eyes', 'keep my voice steady', 'knuckles turning white',
+    'said, her voice firm', 'felt a glimmer of hope', 'heart pounded in her chest', 'cast long shadows',
+    'eyes widened in shock', 'first time since', 'air grew thick', 'feel a sense of pride', 'horizon, painting the sky',
+    'whispered, his voice barely', 'faint, almost imperceptible', 'said, his voice firm', 'continued to fall, washing',
+    'casting an eerie glow', 'ahead would be long', 'knew, with a chilling certainty', 'eyes locking onto',
+    'voice thick with emotion', 'mind already racing', 'air was thick with anticipation', 'said, trying to keep',
+    'find a way to break', 'long, dancing shadows', 'uuwu, uuwu, uuwu', 'casting a golden glow',
+    'chill run down his spine', 'whispered, her voice trembling', 'needed to find a way', 'change the course of history',
+    "couldn't quite place", 'eyes wide with terror', 'pushed open the door', 'time would tell', 'would change the course',
+    'need to find a way', 'sent shivers down my spine', 'asked, my voice trembling', 'find a way to make',
+    'painting the sky in hues', 'eyes wide with disbelief', 'air grew colder', 'said, her voice low',
+    'time in a long time', 'began to take shape', 'life would never', 'said, his voice laced', 'small, almost imperceptible',
+    'eyes filled with tears', 'one thing was certain', 'challenges that lay ahead', 'cool night air',
+    'whatever lay ahead', 'could feel the power', 'first time in years', 'legs over the side of the bed',
+    'one step ahead', 'eyes fluttered open', 'shiver ran down my spine', 'like a physical blow',
+    'chill ran down my spine', "couldn't help but smile", 'nodded, a small smile', 'set, casting long',
+    'horizon, casting a warm', 'given a second chance', 'voice tinged with a hint', 'shiver run down her spine',
+    'took another step', 'like a second skin', 'make things right', 'shook my head, trying', 'asked, trying to keep',
+    'eyes darted around', 'could almost hear', 'tasting like ash', 'darting around the room', 'exchanged uneasy glances',
+    'screen flickered to life', 'whatever came next', 'mix of excitement and trepidation', 'fingers dancing across',
+    'heart pounding with a mixture', 'felt like hours', 'felt a flicker of hope', 'felt a surge of energy',
+    'blinding flash of light', 'heart pounded in his chest', 'wave of nausea washed', 'senses on high alert',
+    'deep breath and stepped', 'blood run cold', 'brow furrowed with concern', 'warm, golden glow',
+    'heart skip a beat', 'air hung heavy', 'seemed to hold its breath', 'air crackled with energy',
+    'mind racing with a thousand', 'Lumina, Lumina, Lumina', 'locked onto mine', 'felt a surge of anger',
+    'voice devoid of emotion', 'first light of dawn', 'breath, trying to steady',
+]
+
+
 def detect_negation_pivot_en(text: str) -> list[dict]:
     family = RULE_TO_FAMILY["negation_pivot_en"]
     hits = []
+    # 只打显式对照结构（"Not X, but Y" negative parallelism）；
+    # 普通叙事否定（"did not move. She..."）不属于本 family，不命中。
     patterns = [
-        re.compile(r"\bNot\s+[^.—!?]{2,40}\s*[—.]\s*(?:[A-Za-z]|but\b|it was\b)", re.IGNORECASE),
+        # not X, but (also) Y —— not 与 but 之间须有分隔标点
+        re.compile(r"\bnot\s+[^.!?;]{2,60}?[,;—]\s*but\b", re.IGNORECASE),
         re.compile(r"\bnot because\b.{3,40},\s*but because\b", re.IGNORECASE),
+        # Not X. Instead / Rather, Y —— 句界对照（句首大写限定）
+        re.compile(r"\bnot\s+[^.!?]{2,60}\.\s+(?:Instead|Rather)\b"),
     ]
     for pattern in patterns:
         for m in pattern.finditer(text):
@@ -1388,6 +1466,33 @@ def detect_negation_pivot_en(text: str) -> list[dict]:
                 "start": m.start(),
                 "end": m.end(),
             })
+    return hits
+
+
+def detect_slop_phrase_en(text: str) -> list[dict]:
+    family = RULE_TO_FAMILY["slop_phrase_en"]
+    lowered = text.lower()
+    hits = []
+    for phrase in SLOP_PHRASES_EN:
+        start = 0
+        while True:
+            idx = lowered.find(phrase, start)
+            if idx < 0:
+                break
+            hits.append({
+                "rule": "slop_phrase_en",
+                "family": family,
+                "group": FAMILY_GROUPS[family],
+                "cluster": FAMILY_CLUSTERS[family],
+                "pattern": "antislop_lexicon",
+                "location": _locate(text, idx),
+                "snippet": text[idx:idx + len(phrase)],
+                "confidence": "high",
+                "severity": "low",
+                "start": idx,
+                "end": idx + len(phrase),
+            })
+            start = idx + len(phrase)
     return hits
 
 
@@ -1966,6 +2071,7 @@ RULES_ZH = (
 RULES_EN = (
     lambda text, whitelist, thresholds: detect_em_dash_density_en(text, thresholds),
     lambda text, whitelist, thresholds: detect_negation_pivot_en(text),
+    lambda text, whitelist, thresholds: detect_slop_phrase_en(text),
     lambda text, whitelist, thresholds: detect_staccato_run_en(text, thresholds),
     lambda text, whitelist, thresholds: detect_simile_density_en(text, thresholds),
     lambda text, whitelist, thresholds: detect_banned_markdown(text),

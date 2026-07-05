@@ -99,13 +99,18 @@ def build_directive(
     seen_ids = set()
     idx = 1
 
+    # en 检测处于观测模式：规则/基线成熟度不足（negation 类误报率高、金标样本少），
+    # cluster alert 全部降为 L 级 observed，不产 directive entry、不触发 distribution lane。
+    # zh 不受影响。恢复立案的前提：en 词表条目级误杀清洗 + 金标扩样重校准。
+    observe_only = lint.get("language") == "en"
+
     for alert in lint.get("cluster_alerts", []) or []:
         if not isinstance(alert, dict):
             continue
         family = alert.get("family") or alert.get("cluster") or "unknown"
         cluster = alert.get("cluster") or FAMILY_REGISTRY.get(family, {}).get("cluster", "")
         severity = str(alert.get("severity") or "low")
-        level = _classify_level(family, severity, cluster)
+        level = "L" if observe_only else _classify_level(family, severity, cluster)
         entry_id = _entry_id(scene_id, family, idx, alert)
         seen_ids.add(entry_id)
         idx += 1
