@@ -27,6 +27,7 @@ CLUSTER_MIGRATION_DENYLIST = {
 }
 
 M_OBJECTION_CLUSTERS = {"explanatory_detour", "silence_pause_cliche", "action_log"}
+OBSERVE_ONLY_FAMILIES = {"meta_language_leak"}
 HIGH_SEVERITIES = {"high", "catastrophic", "major"}
 GENERIC_FUNCTION_CLAIMS = (
     "节奏需要停顿",
@@ -110,7 +111,11 @@ def build_directive(
         family = alert.get("family") or alert.get("cluster") or "unknown"
         cluster = alert.get("cluster") or FAMILY_REGISTRY.get(family, {}).get("cluster", "")
         severity = str(alert.get("severity") or "low")
-        level = "L" if observe_only else _classify_level(family, severity, cluster)
+        level = (
+            "L"
+            if observe_only or family in OBSERVE_ONLY_FAMILIES
+            else _classify_level(family, severity, cluster)
+        )
         entry_id = _entry_id(scene_id, family, idx, alert)
         seen_ids.add(entry_id)
         idx += 1

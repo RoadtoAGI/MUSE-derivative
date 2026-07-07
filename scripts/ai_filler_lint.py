@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 import argparse
+import math
 import re
 import sys
 from collections import Counter
@@ -31,6 +32,7 @@ FAMILY_REGISTRY = {
     "contrastive_negation_assertion": {"group": "semantic_heuristic", "cluster": "explanatory_detour", "aliases": ["不是A是B", "不是A而是B"]},
     "micro_punchline_cadence": {"group": "semantic_heuristic", "cluster": "micro_punchline_cadence", "aliases": ["短句承重", "计数字台词", "首次末次标记"]},
     "state_persistence_template": {"group": "semantic_heuristic", "cluster": "silence_pause_cliche", "aliases": ["状态持续模板", "还在那里"]},
+    "meta_language_leak": {"group": "hard", "cluster": "meta_language_leak", "aliases": ["元语言泄漏"]},
 }
 
 FAMILY_GROUPS = {fid: entry["group"] for fid, entry in FAMILY_REGISTRY.items()}
@@ -63,6 +65,8 @@ RULE_TO_FAMILY = {
     "slop_phrase_en": "lexical_cliche",
     "staccato_run": "rhythm_fragmentation",
     "simile_density_en": "figurative_debt",
+    "meta_language_leak_zh": "meta_language_leak",
+    "meta_language_leak_en": "meta_language_leak",
 }
 
 
@@ -171,6 +175,11 @@ FAMILY_DENSITY_BASELINE: dict[str, dict[str, float]] = {
     },
 }
 
+UNIFORM_RHYTHM_CV_FLOOR: dict[str, float] = {
+    "zh": 0.4951,
+    "en": 0.0,
+}
+
 FAMILY_SOVEREIGNTY: dict[str, str] = {
     "marker_pollution": "S",
     "lexical_cliche": "S",
@@ -193,6 +202,29 @@ KEYWORD_CLICHE_PATTERNS = [
     "不由得", "不禁", "似乎", "仿佛", "好像",
     "极", "格外", "稍稍",
 ]
+
+# meta_language_leak seed lexicons: design §2.2, sourced from the low-score audit
+# sample and filtered aigc-detector template/hedging lists.
+META_LANGUAGE_ZH = (
+    "综上所述",
+    "值得注意的是",
+    "需要指出的是",
+    "不难发现",
+    "由此可见",
+    "总的来说",
+    "换言之",
+    "综合来看",
+)
+
+META_LANGUAGE_EN = (
+    "it is worth noting",
+    "it should be noted",
+    "it is important to note",
+    "in conclusion",
+    "as previously mentioned",
+    "firstly, ... secondly",
+    "to summarize",
+)
 
 # 命中位置周围 2 字内若构成豁免词则跳过——主要处理 "极" 的固定词组 FP。
 KEYWORD_CLICHE_EXEMPT_CONTEXTS = {
@@ -327,6 +359,82 @@ def _resolve_device_budget(devices: Iterable[str]) -> tuple[dict[str, float], li
         for family, multiplier in budget.items():
             multipliers[family] = max(multipliers.get(family, 1.0), multiplier)
     return multipliers, valid_devices
+
+
+def _mask_chars(chars: list[str], start: int, end: int) -> None:
+    for idx in range(start, end):
+        if chars[idx] != "\n":
+            chars[idx] = " "
+
+
+def _mask_quoted_spans(text: str) -> str:
+    chars = list(text)
+    spans: list[tuple[int, int]] = []
+    for open_quote, close_quote in (("「", "」"), ("『", "』"), ("“", "”")):
+        pos = 0
+        while True:
+            start = text.find(open_quote, pos)
+            if start < 0:
+                break
+            end = text.find(close_quote, start + len(open_quote))
+            if end < 0:
+                pos = start + len(open_quote)
+                continue
+            spans.append((start, end + len(close_quote)))
+            pos = end + len(close_quote)
+
+    pos = 0
+    while True:
+        start = text.find('"', pos)
+        if start < 0:
+            break
+        end = text.find('"', start + 1)
+        if end < 0:
+            break
+        spans.append((start, end + 1))
+        pos = end + 1
+
+    for start, end in spans:
+        _mask_chars(chars, start, end)
+    return "".join(chars)
+
+
+def _meta_language_patterns(lang: str) -> list[tuple[str, re.Pattern[str]]]:
+    if lang == "en":
+        patterns = []
+        for phrase in META_LANGUAGE_EN:
+            if phrase == "firstly, ... secondly":
+                pattern = r"\bfirstly\s*,[\s\S]{0,200}?\bsecondly\b"
+            else:
+                pattern = r"\b" + r"\s+".join(map(re.escape, phrase.split())) + r"\b"
+            patterns.append((phrase, re.compile(pattern, flags=re.IGNORECASE)))
+        return patterns
+    return [(phrase, re.compile(re.escape(phrase))) for phrase in META_LANGUAGE_ZH]
+
+
+def detect_meta_language(text: str, lang: str = "zh") -> list[dict]:
+    selected_lang = _normalize_lang(text, lang)
+    masked = _mask_quoted_spans(text)
+    rule = f"meta_language_leak_{selected_lang}"
+    family = RULE_TO_FAMILY[rule]
+    hits = []
+    for phrase, pattern in _meta_language_patterns(selected_lang):
+        for m in pattern.finditer(masked):
+            hits.append({
+                "rule": rule,
+                "family": family,
+                "group": FAMILY_GROUPS[family],
+                "cluster": FAMILY_CLUSTERS[family],
+                "pattern": phrase,
+                "location": _locate(text, m.start()),
+                "snippet": text[m.start():m.end()].replace("\n", " ")[:100],
+                "span": text[m.start():m.end()],
+                "start": m.start(),
+                "end": m.end(),
+                "confidence": "high",
+                "severity": "medium",
+            })
+    return hits
 
 
 def detect_keyword_cliche(text: str, whitelist: Iterable[str] = ()) -> list[dict]:
@@ -1565,6 +1673,62 @@ def detect_simile_density_en(text: str, thresholds: Thresholds | None = None) ->
     }]
 
 
+def _sentence_lengths(text: str, lang: str) -> list[int]:
+    selected_lang = _normalize_lang(text, lang)
+    if selected_lang == "en":
+        lengths = []
+        for m in re.finditer(r"[^.!?\n]+[.!?]", text):
+            word_count = len(_en_words(m.group()))
+            if word_count:
+                lengths.append(word_count)
+        return lengths
+
+    lengths = []
+    for m in re.finditer(r"[^。！？…]+[。！？…]+[」』”\"]?", text):
+        sentence = m.group()
+        net_len = len(_PUNCT_STRIP_RE.sub("", sentence))
+        if net_len:
+            lengths.append(net_len)
+    return lengths
+
+
+def _coefficient_of_variation(values: list[int]) -> float:
+    mean = sum(values) / len(values)
+    if mean == 0:
+        return 0.0
+    variance = sum((value - mean) ** 2 for value in values) / len(values)
+    return math.sqrt(variance) / mean
+
+
+def check_uniform_rhythm(text: str, lang: str) -> dict | None:
+    selected_lang = _normalize_lang(text, lang)
+    lengths = _sentence_lengths(text, selected_lang)
+    if len(lengths) < 12:
+        return None
+
+    floor = UNIFORM_RHYTHM_CV_FLOOR.get(selected_lang, 0.0)
+    cv = _coefficient_of_variation(lengths)
+    if cv >= floor:
+        return None
+
+    return {
+        "issue_type": "uniform_rhythm",
+        "severity": "minor",
+        "trigger": {
+            "sentence_count": len(lengths),
+            "sentence_cv": round(cv, 4),
+            "cv_floor": floor,
+            "language": selected_lang,
+        },
+        "distribution": {
+            "mode": "scene_level",
+            "min_sentence_length": min(lengths),
+            "max_sentence_length": max(lengths),
+            "avg_sentence_length": round(sum(lengths) / len(lengths), 2),
+        },
+    }
+
+
 SEMANTIC_CLUSTERS = {
     "figurative_debt",
     "abstract_explanation",
@@ -2045,6 +2209,7 @@ def check_low_information_cadence(
 
 
 RULES_ZH = (
+    lambda text, whitelist, thresholds: detect_meta_language(text, "zh"),
     lambda text, whitelist, thresholds: detect_keyword_cliche(text, whitelist),
     lambda text, whitelist, thresholds: detect_conjunction_overuse(text),
     lambda text, whitelist, thresholds: detect_parallel_negation(text),
@@ -2069,6 +2234,7 @@ RULES_ZH = (
 )
 
 RULES_EN = (
+    lambda text, whitelist, thresholds: detect_meta_language(text, "en"),
     lambda text, whitelist, thresholds: detect_em_dash_density_en(text, thresholds),
     lambda text, whitelist, thresholds: detect_negation_pivot_en(text),
     lambda text, whitelist, thresholds: detect_slop_phrase_en(text),
@@ -2117,10 +2283,15 @@ def run_ai_filler_lint(
         if hit.get("rule") == "zero_yield_micro_clause_candidate"
     ]
     low_information = check_low_information_cadence(zero_yield_hits, cluster_alerts, scene_text)
+    uniform_rhythm = check_uniform_rhythm(scene_text, selected_lang)
+    scene_level_issues = [
+        issue for issue in (low_information, uniform_rhythm)
+        if issue is not None
+    ]
     return {
         "lint_hits": lint_hits,
         "cluster_alerts": cluster_alerts,
-        "scene_level_issues": [low_information] if low_information else [],
+        "scene_level_issues": scene_level_issues,
         "language": selected_lang,
         "device_budget_applied": bool(valid_devices),
         "budget_class": valid_devices,
@@ -2151,6 +2322,11 @@ def analyze(
         if hit.get("rule") == "zero_yield_micro_clause_candidate"
     ]
     low_information = check_low_information_cadence(zero_yield_hits, cluster_alerts, text)
+    uniform_rhythm = check_uniform_rhythm(text, selected_lang)
+    scene_level_issues = [
+        issue for issue in (low_information, uniform_rhythm)
+        if issue is not None
+    ]
     pattern_counter = Counter(h["pattern"] for h in all_hits)
     total_chars = len(text)
     return {
@@ -2160,7 +2336,7 @@ def analyze(
         "budget_source": "declared" if valid_devices else "default",
         "hits": all_hits,
         "cluster_alerts": cluster_alerts,
-        "scene_level_issues": [low_information] if low_information else [],
+        "scene_level_issues": scene_level_issues,
         "density": {
             "total_chars": total_chars,
             "hits_per_1k": round(len(all_hits) / max(total_chars, 1) * 1000, 2),
