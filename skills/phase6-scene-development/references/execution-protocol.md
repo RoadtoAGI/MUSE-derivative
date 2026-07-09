@@ -77,8 +77,10 @@ phase6_dispatcher(scenes_in_order):
             #     - scene_id: S03          # 精确单场
             #       reason: 单角色内心戏   # 多角色豁免须引 scene_card 证据
             #
-            # 失败语义：actor 返回"排练未完成 + 缺项名" → 该角色无 performance 文件，
-            # writer 按"仅凭 role_brief + skill package"素材缺席降级分支兜底。
+            # 失败语义：actor 返回"排练未完成 + 缺项名" → 不中断本场其余角色的 fan-out；
+            # 该角色缺 performance 文件会被 Step 4d 覆盖检查拦下，须补产该角色素材（或补本场
+            # 合法 skip 条目）后才放行 writer；二次仍失败 → ESCALATED，本场不产 draft。
+            # writer 的"素材缺席降级"分支只在**本场有合法 skip 条目**时到达。
             #
             # 静态 / 动态分层（§0.4 约定）：
             # - 元配置：${CLAUDE_PLUGIN_ROOT}/agents/character-actor.md
@@ -157,6 +159,7 @@ phase6_dispatcher(scenes_in_order):
 
             result = Task(
                 subagent_type="writer",
+                work_dir=WORKDIR,   # 结构化字段：让 PreToolUse 覆盖检查 hook 无需从 prompt 猜 run 根
                 prompt=f"为场景 {scene.id} 首次生成 draft。按 SKILL.md 读输入、"
                        f"产 pipeline/scenes/scene_{scene.id}.md（单路径协议；fresh session 即便看到已存在文件也忽略）。"
                        f"完成回复 'done draft for scene {scene.id}'。"

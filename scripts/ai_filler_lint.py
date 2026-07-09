@@ -20,6 +20,7 @@ import yaml
 FAMILY_REGISTRY = {
     "marker_pollution": {"group": "hard", "cluster": "lexical_cliche", "aliases": ["Markdown污染"]},
     "lexical_cliche": {"group": "hard", "cluster": "lexical_cliche", "aliases": ["词表面层", "硬cliche"]},
+    "fragment_settlement": {"group": "hard", "cluster": "micro_punchline_cadence", "aliases": ["碎片结算短句"]},
     "connector_overuse": {"group": "hard", "cluster": "connector_overuse", "aliases": ["段首然后", "连接词过用"]},
     "rhythm_fragmentation": {"group": "syntax_heuristic", "cluster": "rhythm_fragmentation", "aliases": ["节奏碎片化", "短段刷屏"]},
     "repeated_head": {"group": "syntax_heuristic", "cluster": "rhythm_fragmentation", "aliases": ["同字起手", "排比"]},
@@ -63,6 +64,7 @@ RULE_TO_FAMILY = {
     "em_dash_density": "dash_overuse",
     "negation_pivot_en": "contrastive_negation_assertion",
     "slop_phrase_en": "lexical_cliche",
+    "fragment_settlement": "fragment_settlement",
     "staccato_run": "rhythm_fragmentation",
     "simile_density_en": "figurative_debt",
     "meta_language_leak_zh": "meta_language_leak",
@@ -182,6 +184,7 @@ UNIFORM_RHYTHM_CV_FLOOR: dict[str, float] = {
 
 FAMILY_SOVEREIGNTY: dict[str, str] = {
     "marker_pollution": "S",
+    "fragment_settlement": "S",
     "lexical_cliche": "S",
     "connector_overuse": "S",
     "rhythm_fragmentation": "S",
@@ -410,6 +413,41 @@ def _meta_language_patterns(lang: str) -> list[tuple[str, re.Pattern[str]]]:
             patterns.append((phrase, re.compile(pattern, flags=re.IGNORECASE)))
         return patterns
     return [(phrase, re.compile(re.escape(phrase))) for phrase in META_LANGUAGE_ZH]
+
+
+# 叙述层碎片结算短句：叙述者用超短句替读者做情绪结算（名著 703 场景四形态 P90=0，
+# 95% 场景零命中——单发即显著异常）。对白内不检测（引号 mask）；句号限定
+# （叹号是对白/爆发腔的合法形态）。
+FRAGMENT_SETTLEMENT_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("negation_dangling", re.compile(r"(?:^|[。！？\n])\s*(不是[一-鿿]{1,6})。")),
+    ("binary_evaluative_pair", re.compile(r"(很[一-鿿]{1,3}[，,]很[一-鿿]{1,3})。")),
+    ("self_assurance", re.compile(r"(?:^|[。！？\n])\s*(可以的|还来得及|来得及|够了|就这样|挺好)。")),
+    ("commentary_settlement", re.compile(r"[，,]((?:倒|总归|也算)(?!了|下|出|在|进|退|水|茶|酒|地)[一-鿿]{1,4})。")),
+]
+
+
+def detect_fragment_settlement(text: str) -> list[dict]:
+    family = RULE_TO_FAMILY["fragment_settlement"]
+    masked = _mask_quoted_spans(text)
+    hits = []
+    for subform, pattern in FRAGMENT_SETTLEMENT_PATTERNS:
+        for m in pattern.finditer(masked):
+            start = m.start(1)
+            hits.append({
+                "rule": "fragment_settlement",
+                "family": family,
+                "group": FAMILY_GROUPS[family],
+                "cluster": FAMILY_CLUSTERS[family],
+                "pattern": subform,
+                "location": _locate(text, start),
+                "snippet": text[start:m.end(1)][:100],
+                "span": text[start:m.end(1)],
+                "start": start,
+                "end": m.end(1),
+                "confidence": "high",
+                "severity": "medium",
+            })
+    return hits
 
 
 def detect_meta_language(text: str, lang: str = "zh") -> list[dict]:
@@ -1974,6 +2012,10 @@ PER_FAMILY_OVERRIDE = {
         "same_rule_scene_count_gte": 2,
         "same_anchor_repeated_count_gte": 2,
     },
+    # 名著 703 场景四子形态 P90=0（95% 场景零命中）——单发即显著异常，立案粒度 1
+    "fragment_settlement": {
+        "same_family_scene_count_gte": 1,
+    },
 }
 
 
@@ -2210,6 +2252,7 @@ def check_low_information_cadence(
 
 RULES_ZH = (
     lambda text, whitelist, thresholds: detect_meta_language(text, "zh"),
+    lambda text, whitelist, thresholds: detect_fragment_settlement(text),
     lambda text, whitelist, thresholds: detect_keyword_cliche(text, whitelist),
     lambda text, whitelist, thresholds: detect_conjunction_overuse(text),
     lambda text, whitelist, thresholds: detect_parallel_negation(text),

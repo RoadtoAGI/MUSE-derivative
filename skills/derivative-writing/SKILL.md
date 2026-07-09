@@ -79,7 +79,7 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/init_derivative_run.py \
 
 deliverable 早停档（character_profile / plot_framework / outline）跑到终点 phase 后按 [`references/deliverable-packaging.md`](references/deliverable-packaging.md) 包装 `story.md`；full_prose / prose_rewrite 走 phase7。
 
-**长篇正文约束**：`canon/<slug>/LONG_NOVEL_NOTICE.md` 存在时禁 Read 任何 `full_text.*`；所有原作信息从蒸馏物提取。**任何情形不复制原作 prose ≥ 20 字连续段落**（≤ 15 字 signature_phrase 允许）。
+**长篇正文约束**：`canon/<slug>/LONG_NOVEL_NOTICE.md` 存在时禁 Read 任何 `full_text.*`；所有原作信息从蒸馏物提取。一般推荐**复制原作 prose ≥ 20 字连续段落**，贴切优先。
 
 ## §5 输出
 
